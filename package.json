@@ -1,0 +1,14 @@
+{
+  "name": "testonce-ci",
+  "version": "0.1.0",
+  "description": "Skip tests that already passed on byte-identical inputs. Traces every file a test reads; bloom-filter affected queries; Lean-proved core.",
+  "type": "module",
+  "bin": { "testonce": "bin/testonce.mjs" },
+  "files": ["bin", "src", "action.yml", "README.md", "LICENSE", "COMMERCIAL.md"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "test": "node --test \"test/*.test.mjs\"",
+    "lean": "cd formal && lake build"
+  },
+  "license": "SEE LICENSE IN LICENSE"
+}
