@@ -6,6 +6,7 @@ import * as bloom from './bloom.mjs';
 import { traced, traceStatus } from './trace.mjs';
 import { doctor, whyNoTrace } from './doctor.mjs';
 import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore } from './inputs.mjs';
+import { unlock } from './unlock.mjs';
 import { envFingerprint, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
 
 const say = (msg) => process.stderr.write(`testonce: ${msg}\n`);
@@ -273,14 +274,24 @@ export async function each(args) {
   return tally.failed.length ? 1 : 0;
 }
 
-// Paid modules (shared cache, add-ons, connectors) ship only in the private package. In the
-// public core they are absent, and the command says where to get them instead of crashing.
+// Paid modules (shared cache, add-ons, connectors) ship only in the private package. In the free
+// build they are absent: with TESTONCE_KEY set they are downloaded once (src/unlock.mjs), else the
+// command says where to get them instead of crashing.
 const PRICING = 'https://testonce-production.up.railway.app/#price';
+const missing = (e) => e?.code === 'ERR_MODULE_NOT_FOUND';
 async function paid(spec, feature) {
   try { return await import(spec); }
   catch (e) {
-    if (e?.code === 'ERR_MODULE_NOT_FOUND') { say(`${feature} is part of testonce's paid features, not this free build. See ${PRICING}`); return null; }
-    throw e;
+    if (!missing(e)) throw e;
+    const key = process.env.TESTONCE_KEY;
+    if (!key) { say(`${feature} is part of testonce's paid features, not this free build. Buy a plan at ${PRICING}, then set TESTONCE_KEY to the license key from checkout.`); return null; }
+    try { await unlock({ key, api: process.env.TESTONCE_API || undefined }); } catch (err) { say(`cannot unlock ${feature}: ${err.message}`); return null; }
+    try { return await import(spec); }
+    catch (e2) {
+      if (!missing(e2)) throw e2;
+      say(`${feature} is not included in your testonce plan. See ${PRICING}`);
+      return null;
+    }
   }
 }
 

@@ -1,10 +1,8 @@
 # gamify: `testonce score` and `testonce publish`
 
-Two free commands that turn the run history testonce already keeps into a level, a streak, badges, and an honest estimate of the time and money skipping saved. They are part of the CLI, not an add-on: no plan is needed.
+Two free, optional commands for teams that want to see how much time skipping tests saved, and to share it. `testonce score` turns the run history testonce already keeps into a level, a streak, badges, and an estimate of the time and money saved. `testonce publish` sends a run's counts to a public leaderboard and README badge. They are part of the CLI, not an add-on: no plan is needed.
 
-Command name: these docs write `testonce`, the name the CLI is being renamed to. Until `package.json` installs a `testonce` binary (today `bin` has only `testonce`), run the same commands as `testonce score` and `testonce publish`.
-
-Status: implemented and unit tested (`test/gamify-levels.test.mjs`, `test/gamify-score.test.mjs`, `test/gamify-publish.test.mjs`, no network). The modules live in `src/gamify/`; they are not wired into `src/cli.mjs` by these files. `publish` has not yet been run against the hosted API in a real GitHub Actions job; the tests use a stub for both the identity-token call and the API, and the request body was checked against the hosted API's own validator (`validateRun` in `server/lib/app.mjs`).
+Status: implemented and unit tested (`test/gamify-levels.test.mjs`, `test/gamify-score.test.mjs`, `test/gamify-publish.test.mjs`, no network). The modules live in `src/gamify/`. `publish` has not yet been run against the hosted API in a real GitHub Actions job; the tests use a stub for both the identity-token call and the API, and the request body was checked against the hosted API's own request validator.
 
 ## `testonce score`
 
@@ -79,7 +77,7 @@ Posts the summary of this CI run to the hosted API, which keeps a per-repo total
 
 ```yaml
 permissions:
-  id-token: write        # lets the job request a short-lived identity token from GitHub
+  id-token: write        # lets the job request a short-lived identity token (OIDC) from GitHub
   contents: read
 steps:
   - uses: actions/checkout@v4
@@ -99,7 +97,7 @@ One POST to `<api>/v1/runs` with this JSON body and nothing else:
 
 `repo` and `sha` come from `GITHUB_REPOSITORY` and `GITHUB_SHA`. The other six are counts and millisecond totals from the run history. `public` is `true` only with `--public`. **Never sent: file paths, test names, environment variables, command lines, code, or file contents.** The body is built field by field from this list (`buildBody` in `src/gamify/publish.mjs`), and `test/gamify-publish.test.mjs` fails if a test name, path, environment value or token appears in it. `--dry-run` prints the exact body without sending anything, and works on your own machine.
 
-The request carries an `Authorization: Bearer` header holding a GitHub Actions OIDC token for audience `testonce`, which tells the server which repository is speaking. The token is requested from GitHub with `GET ${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=testonce` using `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. Neither token is printed or stored. The API URL must be `https` (`http` only for `localhost`), because the identity token travels with the request.
+The request carries an `Authorization: Bearer` header holding a GitHub Actions OIDC token for audience `testonce`. OIDC tokens are short-lived signed proofs that GitHub issues to a CI job; this one tells the server which repository is speaking. The token is requested from GitHub with `GET ${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=testonce` using `ACTIONS_ID_TOKEN_REQUEST_TOKEN`. Neither token is printed or stored. The API URL must be `https` (`http` only for `localhost`), because the identity token travels with the request.
 
 ### How a run is counted
 
@@ -125,11 +123,11 @@ The last row is deliberate. The request had left the machine, so the server may 
 
 ### API URL
 
-`--api URL`, else `TESTONCE_API`, else the default in `src/gamify/publish.mjs` (`DEFAULT_API`, currently a placeholder the maintainers set when the service is live).
+`--api URL`, else `TESTONCE_API`, else the default hosted service, `https://testonce-production.up.railway.app`.
 
 ## Limits
 
 - Not yet exercised against the live hosted service or a real Actions job (see Status).
-- Exactly-once delivery needs an idempotency key honored by the server (not in `server/` today). Until then `publish` is at-most-once when an answer is lost.
+- Exactly-once delivery needs an idempotency key honored by the server (the hosted service does not do this today). Until then `publish` is at-most-once when an answer is lost.
 - History is capped at 30 runs per test, so lifetime totals are not available without changing the cache format.
 - Streaks and badges use UTC days and the local history only.

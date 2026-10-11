@@ -71,6 +71,8 @@ test('env fingerprint: default mode ignores CI noise; allowlist mode hashes only
   const a = envFingerprint({ PATH: '/bin', GITHUB_RUN_ID: '1', FOO: 'x' });
   assert.equal(a.hash, envFingerprint({ PATH: '/bin', GITHUB_RUN_ID: '2', FOO: 'x' }).hash);
   assert.notEqual(a.hash, envFingerprint({ PATH: '/bin', GITHUB_RUN_ID: '1', FOO: 'y' }).hash);
+  // two GitHub-hosted runners differ in SYSTEMD_EXEC_PID; a pass on one must still match on the other
+  assert.equal(envFingerprint({ PATH: '/bin', SYSTEMD_EXEC_PID: '812' }).hash, envFingerprint({ PATH: '/bin', SYSTEMD_EXEC_PID: '1907' }).hash);
   const opts = { mode: 'allowlist', include: ['FOO'] };
   assert.equal(envFingerprint({ PATH: '/bin', FOO: 'x', SESSION: 'a' }, opts).hash, envFingerprint({ PATH: '/bin', FOO: 'x', SESSION: 'b' }, opts).hash);
   assert.notEqual(envFingerprint({ FOO: 'x' }, opts).hash, envFingerprint({ FOO: 'y' }, opts).hash);

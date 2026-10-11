@@ -20,6 +20,7 @@ per person who uses them; CI runners and bots don't need seats.
 - Billed by Stripe. Monthly and yearly plans cancel anytime, effective at the end of the period.
 - Lifetime covers Team (the shared cache), including future versions, for as long as testonce
   is distributed. It doesn't include add-ons.
+- A license key is issued per checkout. It is revoked when the subscription ends or the payment is refunded or disputed.
 - A seat is a license to use the feature. It doesn't promise support or an SLA.
 - Buy: https://testonce-production.up.railway.app/#price
 - Seat changes, cancellation, questions: jawaun.brown95@gmail.com

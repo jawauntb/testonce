@@ -5,8 +5,11 @@ description: Skip tests that already passed on byte-identical inputs, and find w
 
 # testonce
 
-testonce runs each test under strace and records every file it touches. A test that passed
-is skipped while all of those files, the command and the environment are byte-identical.
+Problem: rerunning a whole test suite after every small edit wastes minutes on tests whose
+inputs did not change. testonce runs each test under `strace` (a Linux tool that logs every
+file a program opens) and records every file the test touches. A test that passed is skipped
+while all of those files, the command and the environment are byte-identical. If anything
+differs, or testonce cannot tell, the test runs.
 
 ## When you are about to run tests
 
@@ -20,13 +23,16 @@ is skipped while all of those files, the command and the environment are byte-id
 ## After an edit
 
 `testonce affected path/you/edited.ts` lists tests whose recorded inputs may include that path.
-It never misses a recorded input (proved); it may list extra tests. Run those first.
+It never misses a test whose recorded inputs include the path (verified for the bloom-filter
+model; a bloom filter is a compact set that can give false alarms but never misses a member),
+and it may list extra tests. Run those first.
 
 ## When something looks wrong
 
 - `testonce explain NAME`: what the test read and whether it would skip now, with the first
   changed input.
-- `testonce status`: cached, uncacheable (with the reason) and quarantined tests.
+- `testonce status`: cached, uncacheable (with the reason) and quarantined tests. Quarantined
+  means a test failed on unchanged inputs, so it always runs until cleared.
 - A test that depends on the clock or randomness: add it to `noCache` in `testonce.json`.
 - To force everything to run: `TESTONCE_FULL=1`.
 

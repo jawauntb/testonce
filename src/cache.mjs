@@ -11,6 +11,9 @@ const VOLATILE_EXACT = new Set(['_', 'PWD', 'OLDPWD', 'SHLVL', 'HOSTNAME', 'TERM
 // Kept to per-run CI bookkeeping; add a name to env.include to count it again. Listed in README.
 const VOLATILE_PREFIX = ['GITHUB_', 'RUNNER_', 'ACTIONS_', 'BUILDKITE_', 'GITLAB_', 'CI_', 'CIRCLE_', 'BLACKSMITH_', 'TESTONCE_', 'TRAVIS_', 'JENKINS_', 'DRONE_'];
 ['BUILD_ID', 'BUILD_NUMBER', 'BUILD_URL', 'BUILD_TAG'].forEach((n) => VOLATILE_EXACT.add(n));
+// systemd's per-process bookkeeping (PIDs, sockets, fd counts): different on every machine, so counting
+// them meant a record from one GitHub-hosted runner never matched another (found by the two-machine e2e).
+['SYSTEMD_EXEC_PID', 'MANAGER_PID', 'MAINPID', 'LISTEN_PID', 'LISTEN_FDS', 'LISTEN_FDNAMES', 'NOTIFY_SOCKET', 'WATCHDOG_PID', 'WATCHDOG_USEC'].forEach((n) => VOLATILE_EXACT.add(n));
 
 // strace cannot see getenv, so every variable counts except per-run CI noise.
 // That over-approximates what the test reads: sound, at some cost in hit rate.
