@@ -1,0 +1,39 @@
+DRAFT: owner and counsel to confirm before release.
+
+testonce
+Copyright (c) 2026 The Aura Farming Company of New York LLC.
+
+This software is source-available. It is not open source in the OSI sense.
+
+1. Free for everyone
+
+   You may use, copy, modify and run this software for any purpose, including
+   commercial use, at no charge, subject to section 2.
+
+2. Paid features need a seat for commercial use
+
+   The paid features are (a) the shared cache: the `testonce share`
+   command and any other way of moving testonce's test records between
+   machines, checkouts or users; and (b) the add-ons: the `testonce
+   flaky`, `shard`, `order`, `report` and `fix` commands and the code in
+   src/addons/; and (c) the connectors: the `testonce mcp` and `testonce api`
+   commands, the code in src/connectors/, and the hosted API and MCP endpoint. Using a paid feature for or inside a for-profit organization
+   requires a subscription to that feature (or a bundle that includes it) with
+   one seat per person who uses it or whose tests use it; the connectors are
+   licensed per organization instead of per seat. CI runners and bots
+   do not need their own seat. Personal projects, education, non-profits and
+   public open-source projects may use every feature free. Terms and buy links
+   are in COMMERCIAL.md.
+
+3. Conditions
+
+   Keep this notice in copies and substantial portions of the software. Do not
+   remove, disable or work around section 2, and do not offer the paid features
+   to others as a hosted or managed service.
+
+4. No warranty
+
+   THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+   IMPLIED. IN NO EVENT SHALL THE AURA FARMING COMPANY OF NEW YORK LLC BE
+   LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY ARISING FROM THE SOFTWARE
+   OR ITS USE, INCLUDING ANY TEST THAT WAS SKIPPED.

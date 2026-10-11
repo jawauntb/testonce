@@ -1,0 +1,20 @@
+{
+  "admissible": {
+    "split": "dev",
+    "repo": "/home/user/admissible",
+    "testGlob": "tests/*.test.mjs",
+    "cmd": ["node", "--test", "{}"],
+    "nodeModules": true,
+    "commits": 8,
+    "select": null
+  },
+  "lattice-animal": {
+    "split": "held-out",
+    "repo": "/home/user/lattice-animal",
+    "testGlob": "tests/*.test.mjs",
+    "cmd": ["node", "--test", "{}"],
+    "nodeModules": false,
+    "commits": 10,
+    "select": { "maxFiles": 40, "timeoutSec": 20 }
+  }
+}
