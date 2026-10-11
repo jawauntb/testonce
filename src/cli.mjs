@@ -4,7 +4,8 @@ import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as bloom from './bloom.mjs';
 import { traced, traceStatus } from './trace.mjs';
-import { doctor, whyNoTrace } from './doctor.mjs';
+import { doctor, noTraceMessage } from './doctor.mjs';
+import { splitLinuxFlag, wantsLinux, inContainer, runInLinux, realIo } from './linux.mjs';
 import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore } from './inputs.mjs';
 import { unlock } from './unlock.mjs';
 import { envFingerprint, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
@@ -14,6 +15,7 @@ const say = (msg) => process.stderr.write(`testonce: ${msg}\n`);
 const USAGE = `usage:
   testonce run [--name NAME] [--full] -- <command...>   run, or skip if it passed on identical inputs
   testonce each [-j N] FILE... -- <command with {}>     run once per file, in parallel, each cached on its own
+  (run and each take --linux, or TESTONCE_LINUX=1, or "linux": true in testonce.json: run inside a Linux container, for macOS)
   testonce affected [--base REF] [PATH...]              tests whose inputs may include these paths
   testonce share pull|push [--remote NAME]             team cache on the repo's own git remote (branch testonce-cache)
   testonce mcp                                          local MCP server on stdio, for Claude Code, Cursor and other agents
@@ -34,7 +36,7 @@ function ago(iso) {
 
 // Said once per command (each() says it once and silences its children): why nothing will be cached.
 function noTraceNotice(tr) {
-  say(`${whyNoTrace(tr)}, so every test runs and nothing is cached. Run \`testonce doctor\` for the fix.`);
+  say(noTraceMessage(tr));
 }
 
 function passthrough(argv, cwd) {
@@ -225,10 +227,16 @@ export function explain([name]) {
 }
 
 export async function main(argv) {
-  const [cmd, ...rest] = argv;
-  if (cmd === 'run' || cmd === 'explain') {
-    const cfg = loadConfig(findRoot(process.cwd()));
-    if (cfg.trustStat) useHashStore(path.join(cfg.cacheDir, 'hashes.json'));
+  let [cmd, ...rest] = argv;
+  if (cmd === 'run' || cmd === 'each' || cmd === 'explain') {
+    const root = findRoot(process.cwd());
+    const cfg = loadConfig(root);
+    if (cmd !== 'explain') {
+      const { flag, args } = splitLinuxFlag(rest);
+      rest = args;
+      if (!inContainer() && wantsLinux({ flag, env: process.env, cfg })) return runInLinux(cmd, rest, { root, cfg, io: await realIo(), say });
+    }
+    if (cmd !== 'each' && cfg.trustStat) useHashStore(path.join(cfg.cacheDir, 'hashes.json'));
   }
   try { return await dispatch(cmd, rest); } finally { flushHashStore(); }
 }
