@@ -42,7 +42,8 @@ testonce: 37 files: 21 skipped, 16 ran, 0 failed
 | A skipped test would have passed, given the three assumptions below | **Verified** (`formal/Testonce/Skip.lean`, SafeVerify receipt in `docs/lea/`) |
 | A pass recorded on one machine skips on another (`share push` / `share pull`, via a branch on your own git remote) | Implemented, tested across two clones (`test/share.test.mjs`) |
 | Paid features are delivered by license key: checkout issues a key, and with `TESTONCE_KEY` set the CLI downloads the modules that plan covers on first use | Implemented, tested against a local fake service (`test/unlock.test.mjs`, `server/test/licenses.test.mjs`); not yet exercised with a live Stripe payment |
-| Skips on macOS or Windows | **No.** Tracing needs Linux strace; elsewhere every test runs, and Linux records do not match a Mac's paths and tools. The shared cache pays off between Linux machines (CI, Linux dev containers, agent sandboxes) |
+| On a Mac, `testonce each --linux ...` / `run --linux ...` runs the tests in a Linux container (Docker Desktop, OrbStack, Colima or Podman), where skips work | Implemented. Tested on Linux: units and an end-to-end run against a stand-in `docker` (`test/linux*.test.mjs`), and real Docker in CI (`test/ci/linux-flow.sh`). `doctor`, the every-test-runs fallback and the no-runtime message are run on a macOS CI runner (`test/ci/mac-flow.sh`). **Not run on a real Mac with a real container runtime.** Container records match later `--linux` runs on that Mac only, not CI. See `docs/mac.md` |
+| Skips natively on macOS or Windows (without a container) | **No.** Tracing needs Linux strace; natively every test runs. A native macOS tracer is not built because it could not be shown complete without testing on Macs (`docs/mac.md`). The shared cache pays off between Linux machines (CI, Linux dev containers, agent sandboxes) |
 | Broken tests get fixed automatically | **No.** `testonce fix` writes a brief of exactly what changed since the last pass and can hand it to your own coding agent; the agent does the fixing |
 
 About the proofs: Lean 4 is a proof checker that verifies a mathematical proof step by step. The
@@ -96,7 +97,7 @@ and only the audit catches it.
 
 ## Measured
 
-Two measurements, both on one machine with one run each, so treat them as examples, not guarantees.
+Three measurements, each on one machine with one sample per cell, so treat them as examples, not guarantees.
 
 **One suite, timed.** A 37-file Node test suite from one repository, on one 4-core machine. Plain `npm test` uses Node's own runner, which already runs files in parallel; the testonce rows use `-j4`. Plain `-j4` was not timed, so the rows are not a like-for-like comparison:
 
@@ -128,9 +129,44 @@ public, so you cannot rerun these exact numbers. The harness, its rules and the 
 [`bench/`](bench/README.md); to measure your own repository, add an entry to `bench/subjects.json` and run
 `node bench/replay.mjs <name>`.
 
+**A public codebase, not ours: gbrain.** [garrytan/gbrain](https://github.com/garrytan/gbrain) is a public
+TypeScript repository whose tests run under Bun, so anyone can rerun this. We ran it ourselves, at commit
+`af7dffc` (2026-10-11), with an earlier build of this code from before the rename from singularity to
+testonce. The gbrain authors did not run it or take part, and this implies no endorsement or use by them.
+
+The sample is 237 of gbrain's 3,154 unit-test files: every 8th file of the sorted list, minus 6 that failed
+a plain screen, 69 that need Postgres or another database, 82 that took more than 12 s each under load, and
+1 flaky file. That skews it toward fast tests, which are the least favourable for skipping gains. Each file
+ran as `bun test --timeout=60000 ./<file>`, 4 at a time (`-j4`), on one shared 4-core machine under heavy load
+(load average about 10 during the timed runs), one sample per cell:
+
+| | Seconds | Files skipped / ran |
+|---|---|---|
+| Plain, two samples | 102.6 and 128.3 | n/a |
+| First run (records) | 177.8 | 0 / 237 |
+| Nothing changed | 45.0 | 210 / 27 |
+| One comment appended to `src/core/semver.ts`, which 23 of the recorded tests read | 53.4 | 193 / 44 |
+| That edit reverted | 39.7 | 211 / 26 |
+
+Two earlier plain samples, at heavier load, took 206.3 s and 229.0 s. Recording cost about 1.4x to 1.7x a
+plain run here. Of the 237 files, 20 are uncacheable and always run: 16 call `git`, 1 calls `docker`, 1 uses a
+unix socket (counted as network) and 2 rewrite a file they read.
+
+Replaying gbrain's last 8 commits gave 480 file-level skips and 0 confirmed wrong skips. The plain check ran
+only on files testonce skipped, so this does not compare the files that ran. There was 1 raw candidate,
+`test/fence-marker-code-context.test.ts`: testonce skipped it on a recorded pass, the plain check failed it once
+and passed on an immediate rerun. It asserts that it finishes in under 150 ms, and 16 concurrent plain runs failed
+16 of 16. That is the clock case, which assumption 1 already excludes. The audit did not fire.
+
+Limits. Every pull request in gbrain bumps `package.json`, which every test reads, so a version bump reruns
+everything: 6 of the 8 replayed commits changed `package.json` or `VERSION`, and only 3 had any skips. We ran
+each file separately, which costs more than gbrain's CI (one `bun test` process per shard), so our plain time
+is not what their CI pays. We did not run the other 2,917 unit files, its Postgres tests or its serial tests.
+The file list and scripts are not yet in `bench/`; the selection rule above is the part to repeat.
+
 ## Install
 
-testonce needs Linux, Node.js 18 or newer, and `strace`.
+testonce needs Linux, Node.js 18 or newer, and `strace`. **On a Mac** use CI or `--linux` (a Linux container); see [docs/mac.md](docs/mac.md).
 
 **GitHub Actions** (the action installs `strace`, restores and saves the `.testonce/` cache directory,
 and puts `testonce` on your PATH):
@@ -150,6 +186,7 @@ directory between jobs, and wrap the test command the same way. Run `testonce do
 ```bash
 testonce run [--name NAME] [--full] -- <command...>   # run, or skip if it passed on identical inputs
 testonce each [-j N] FILE... -- <command with {}>     # one cached run per file, in parallel
+testonce run|each --linux ...                         # same, inside a Linux container (macOS; docs/mac.md)
 testonce affected [--base REF] [PATH...]              # tests whose inputs may include these paths
 testonce share pull|push [--remote NAME]              # team cache on a branch of your own git remote
 testonce status                                       # what's cached, uncacheable, quarantined
@@ -164,8 +201,8 @@ testonce mcp | api                                    # paid Connectors: local M
 `each` runs the command once per file, replacing `{}` with the file name. Each file is cached on its own.
 
 `TESTONCE_FULL=1` runs everything. Without strace (macOS, or a container without
-`CAP_SYS_PTRACE`), testonce runs every test normally, caches nothing, and says why once,
-pointing at `testonce doctor`.
+`CAP_SYS_PTRACE`), testonce runs every test normally, caches nothing, and says why once. On
+macOS the notice points at `--linux`; elsewhere at `testonce doctor`.
 
 ### Cloud sandboxes: run `testonce doctor` first
 

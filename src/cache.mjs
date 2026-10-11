@@ -48,7 +48,9 @@ export function loadConfig(root) {
     ignore: cfg.ignore ?? [],
     denyExec: cfg.denyExec,
     env: cfg.env ?? {},
-    trustStat: cfg.trustStat ?? true,
+    // TESTONCE_TRUST_STAT=0 is set by --linux off a Linux host (src/linux.mjs): re-hash, never trust stat.
+    trustStat: process.env.TESTONCE_TRUST_STAT === '0' ? false : cfg.trustStat ?? true,
+    linux: cfg.linux ?? false,
     noCache: cfg.noCache ?? [],
   };
 }

@@ -8,6 +8,7 @@
   "engines": { "node": ">=18" },
   "scripts": {
     "test": "node --test \"test/*.test.mjs\"",
+    "test:once": "node bin/testonce.mjs each test/*.test.mjs -- node --test {}",
     "lean": "cd formal && lake build"
   },
   "license": "SEE LICENSE IN LICENSE"
