@@ -632,6 +632,59 @@ test('soundness: a write that keeps the bytes a file held before the run (append
   } finally { r.done(); }
 });
 
+// ---- GitHub Actions' runner command files ($GITHUB_STEP_SUMMARY and friends) ----
+const RUNNER_VARS = ['GITHUB_STEP_SUMMARY', 'GITHUB_OUTPUT', 'GITHUB_ENV', 'GITHUB_PATH', 'GITHUB_STATE'];
+// A fresh set of runner files, as the runner makes for each step, already holding an earlier step's lines.
+function runnerFiles(tag) {
+  const d = realpathSync(mkdtempSync(path.join(tmpdir(), 'sing-runner-')));
+  const env = {};
+  for (const n of RUNNER_VARS) { env[n] = path.join(d, `${n.toLowerCase()}_${tag}`); writeFileSync(env[n], `earlier ${tag}\n`); }
+  return { d, env, done: () => rmSync(d, { recursive: true, force: true }) };
+}
+const runWith = (r, env, name, ...cmd) => {
+  const o = spawnSync('node', [BIN, 'run', '--name', name, '--', ...cmd], { cwd: r.dir, encoding: 'utf8', env: { ...process.env, TESTONCE_FULL: '', ...env } });
+  return { code: o.status, err: o.stderr };
+};
+
+test('a test that appends to $GITHUB_STEP_SUMMARY (and the other runner command files) is cached, and skips on the next step\'s files', { skip }, () => {
+  // What Vitest's github-actions reporter does: writeFileSync(GITHUB_STEP_SUMMARY, summary, { flag: 'a' }).
+  const r = repo({ 'add.mjs': ADD, 't.mjs': `import { appendFileSync } from 'node:fs'; import { add } from './add.mjs';
+for (const n of ${JSON.stringify(RUNNER_VARS)}) appendFileSync(process.env[n], 'ran\\n');
+process.exit(add(2, 2) === 4 ? 0 : 1);\n` });
+  const a = runnerFiles('a'), b = runnerFiles('b');
+  try {
+    assert.match(runWith(r, a.env, 't', 'node', 't.mjs').err, /cached t/);
+    assert.equal(readFileSync(a.env.GITHUB_STEP_SUMMARY, 'utf8'), 'earlier a\nran\n');
+    assert.match(runWith(r, b.env, 't', 'node', 't.mjs').err, /skip t/, 'another step: other paths, other earlier lines');
+    r.write('add.mjs', 'export const add = (a, b) => a - b;\n');
+    assert.equal(runWith(r, b.env, 't', 'node', 't.mjs').code, 1, 'its real inputs still count');
+  } finally { r.done(); a.done(); b.done(); }
+});
+
+test('soundness: a test that reads a runner command file, or opens it read-write, is never cached', { skip }, () => {
+  const r = repo({
+    // Passes only while the summary holds one line: what an earlier test appended changes that.
+    'readonly.mjs': "import { readFileSync } from 'node:fs'; process.exit(readFileSync(process.env.GITHUB_STEP_SUMMARY, 'utf8').split('\\n').length === 2 ? 0 : 1);\n",
+    'readappend.mjs': "import { readFileSync, appendFileSync } from 'node:fs'; const ok = readFileSync(process.env.GITHUB_OUTPUT, 'utf8').split('\\n').length === 2; appendFileSync(process.env.GITHUB_OUTPUT, 'x=1\\n'); process.exit(ok ? 0 : 1);\n",
+    // O_RDWR|O_APPEND: the descriptor itself can read what the file held.
+    'rw.mjs': "import { openSync, readSync } from 'node:fs'; const b = Buffer.alloc(64); const n = readSync(openSync(process.env.GITHUB_ENV, 'a+'), b, 0, 64, 0); process.exit(b.subarray(0, n).toString() === 'earlier a\\n' ? 0 : 1);\n",
+  });
+  const a = runnerFiles('a');
+  try {
+    for (const t of ['readonly', 'readappend', 'rw']) {
+      const o = runWith(r, a.env, t, 'node', `${t}.mjs`);
+      assert.equal(o.code, 0, `${t}: ${o.err}`);
+      assert.match(o.err, new RegExp(`not caching ${t}: runner command file used other than by appending`), t);
+    }
+    for (const n of RUNNER_VARS) writeFileSync(a.env[n], 'earlier a\nmore\n');
+    for (const t of ['readonly', 'readappend', 'rw']) {
+      const o = runWith(r, a.env, t, 'node', `${t}.mjs`);
+      assert.doesNotMatch(o.err, new RegExp(`skip ${t}`), `${t}: wrong skip`);
+      assert.equal(o.code, 1, `${t}: must rerun and fail`);
+    }
+  } finally { r.done(); a.done(); }
+});
+
 test('soundness: a call that succeeds only where a path was absent (mkdir, O_EXCL, symlink, link) or present (unlink, rmdir) observed it', { skip }, () => {
   const r = repo({
     'fixture.tmp': 'x',

@@ -25,6 +25,9 @@ export function makeIgnore({ root, cacheDir, ignore = [] }) {
 export const keyOf = (root, abs) => (abs === root ? '.' : abs.startsWith(root + '/') ? abs.slice(root.length + 1) : abs);
 export const absOf = (root, key) => (path.isAbsolute(key) ? key : path.join(root, key));
 
+// Runner command files (read by GitHub's runner after the step): a write-only append is an output, any other contact uncacheable.
+export const runnerFiles = (env, cwd) => ['STEP_SUMMARY', 'OUTPUT', 'ENV', 'PATH', 'STATE'].filter((n) => env['GITHUB_' + n]).map((n) => path.resolve(cwd, env['GITHUB_' + n]));
+
 const STRENGTH = { stat: 1, absent: 1, list: 2, read: 3, exec: 3 };
 
 // Reduce ordered events to {inputs: Map<abs, kind>, outputs: Set<abs>, uncacheable: string[]}.
@@ -33,7 +36,8 @@ const STRENGTH = { stat: 1, absent: 1, list: 2, read: 3, exec: 3 };
 // `privateDirs`: the run's private temp dir (src/tmp.mjs). It was created empty for this run alone, so anything
 // in it the run made itself, and none of it is an input. A path that reaches outside it through a symlink the
 // run created is followed (see `follow`), so that escape is still recorded.
-export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY_EXEC, privateDirs = [] }) {
+export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY_EXEC, privateDirs = [], sinks = [] }) {
+  const sink = new Set(sinks);
   const ignored = makeIgnore({ root, cacheDir, ignore });
   const inPrivate = (abs) => privateDirs.some((p) => abs === p || abs.startsWith(p + '/'));
   const dropped = (abs) => inPrivate(abs) || ignored(abs, keyOf(root, abs));
@@ -76,6 +80,10 @@ export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY
   const wrote = (abs) => { write(abs); const l = locate(abs); touchedVia(abs, l); touchedVia(abs, onDisk(l)); };
   for (const e of events) {
     const abs = e.path;
+    if (sink.has(abs) && e.kind !== 'write') {
+      if (!(e.kind === 'read' && e.kept && e.wo)) reasons.push(`runner command file used other than by appending: ${abs}`);
+      continue;
+    }
     if (e.kind === 'net') {
       // A unix socket in the private temp dir belongs to a process this run started.
       if (!(abs.startsWith('unix:') && inPrivate(real(abs.slice(5)) ?? ''))) reasons.push(`network: ${abs}`);

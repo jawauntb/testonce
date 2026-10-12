@@ -205,7 +205,7 @@ export function parse(text, cwd) {
             // O_EXCL succeeds only where nothing was. Without it or O_TRUNC the open keeps the bytes the file
             // held before the run, which the descriptor can read or measure (an append's offset): an input.
             if (/O_CREAT/.test(flags) && /O_EXCL/.test(flags)) push('absent', q);
-            else if (!/O_TRUNC|O_TMPFILE/.test(flags)) push('read', q, { kept: true });
+            else if (!/O_TRUNC|O_TMPFILE/.test(flags)) push('read', q, { kept: true, ...(/O_WRONLY/.test(flags) && { wo: true }) });
             push('write', q);
           } else push(flags.includes('O_DIRECTORY') ? 'list' : 'read', q);
         }
