@@ -9,6 +9,7 @@ import path from 'node:path';
 const SYSCALLS = [
   'open', 'openat', 'openat2', 'creat', 'stat', 'lstat', 'newfstatat', 'statx', 'access', 'faccessat',
   'faccessat2', 'readlink', 'readlinkat', 'execve', 'execveat', 'connect', 'sendto', 'sendmsg', 'sendmmsg',
+  'socket', 'bind', 'getsockname', 'getsockopt', 'setsockopt',
   'rename', 'renameat', 'renameat2', 'unlink', 'unlinkat', 'mkdir', 'mkdirat', 'rmdir', 'truncate',
   'link', 'linkat', 'symlink', 'symlinkat', 'chmod', 'fchmodat', 'utimensat',
   'chdir', 'fchdir', 'clone', 'clone3', 'fork', 'vfork',
@@ -179,10 +180,14 @@ export function parse(text, cwd) {
   const push = (kind, p, extra) => { if (p) events.push({ kind, path: p, ...extra }); };
   // A readlink, or a no-follow stat that saw a link, looked at the link itself: where it points is an input too.
   const stat = (name, args, p, v) => { push('stat', p, { ...typeFrom(args), ...v }); if (name.startsWith('readlink') || /_mode=S_IFLNK/.test(args.join())) push('link', p, v); };
+  const sockType = new Map(), v6only = new Map(), unbound = new Set(), pending = new Map();
+  const bound = [], dials = [];
+  let t = 0;
 
   for (const c of calls(text)) {
     const { name, args, ret } = c;
     pid = c.pid;
+    t++;
     switch (name) {
       case 'clone': case 'clone3': case 'fork': case 'vfork':
         if (/^\d+$/.test(ret)) cwds.set(ret, here()); break;
@@ -197,7 +202,10 @@ export function parse(text, cwd) {
         for (const q of real && real[0] === '/' && real !== p ? [p, real] : [p]) {
           if (flags.includes('O_PATH')) push('stat', q);
           else if (/O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND/.test(flags)) {
-            if (flags.includes('O_RDWR') && !/O_CREAT|O_TRUNC/.test(flags)) push('read', q);
+            // O_EXCL succeeds only where nothing was. Without it or O_TRUNC the open keeps the bytes the file
+            // held before the run, which the descriptor can read or measure (an append's offset): an input.
+            if (/O_CREAT/.test(flags) && /O_EXCL/.test(flags)) push('absent', q);
+            else if (!/O_TRUNC|O_TMPFILE/.test(flags)) push('read', q, { kept: true });
             push('write', q);
           } else push(flags.includes('O_DIRECTORY') ? 'list' : 'read', q);
         }
@@ -236,7 +244,7 @@ export function parse(text, cwd) {
       case 'link': case 'linkat': {
         const [from, to] = name === 'link' ? [noDir(lit(args[0])), noDir(lit(args[1]))] : [at(args[0], lit(args[1])), at(args[2], lit(args[3]))];
         if (!from || !to) break;
-        if (ok(ret)) events.push({ kind: 'hardlink', path: to, from });
+        if (ok(ret)) { push('absent', to); events.push({ kind: 'hardlink', path: to, from }); } // only where nothing was
         else if (enoent(ret)) push('absent', from);
         else if (/^-1 EEXIST/.test(ret)) push('stat', to);
         break;
@@ -245,26 +253,79 @@ export function parse(text, cwd) {
         const target = lit(args[0]);
         const link = name === 'symlink' ? noDir(lit(args[1])) : at(args[1], lit(args[2]));
         if (!link) break;
-        if (ok(ret)) events.push({ kind: 'symlink', path: link, target });
+        if (ok(ret)) { push('absent', link); events.push({ kind: 'symlink', path: link, target }); } // only where nothing was
         else if (/^-1 EEXIST/.test(ret)) push('stat', link);
         else if (enoent(ret)) push('absent', path.dirname(link));
         break;
       }
-      case 'unlink': case 'rmdir': case 'mkdir': case 'truncate': case 'chmod':
-        if (ok(ret)) push('write', noDir(lit(args[0]))); break;
-      case 'unlinkat': case 'mkdirat': case 'fchmodat': case 'utimensat':
-        if (ok(ret) && lit(args[1])) push('write', at(args[0], lit(args[1]))); break;
+      // A call that succeeds only on what was there observed it: mkdir saw the path absent, unlink and rmdir
+      // saw it present, truncate to a length kept that many of its old bytes.
+      case 'mkdir': case 'mkdirat': {
+        const p = name === 'mkdir' ? noDir(lit(args[0])) : at(args[0], lit(args[1]));
+        if (ok(ret)) { push('absent', p); push('write', p); } else if (/^-1 EEXIST/.test(ret)) push('stat', p); else if (enoent(ret) && p) push('absent', path.dirname(p));
+        break;
+      }
+      case 'unlink': case 'rmdir': case 'unlinkat': {
+        const p = name === 'unlinkat' ? lit(args[1]) && at(args[0], lit(args[1])) : noDir(lit(args[0]));
+        if (ok(ret)) { push('stat', p, { type: name === 'rmdir' || /AT_REMOVEDIR/.test(args[2]) ? 'dir' : 'file' }); push('write', p); } else if (enoent(ret)) push('absent', p);
+        break;
+      }
+      case 'truncate': if (ok(ret)) { const p = noDir(lit(args[0])); push(args[1] === '0' ? 'stat' : 'read', p, { type: 'file' }); push('write', p); } break;
+      // A new mode or timestamp leaves the bytes as they were: the path stays an input.
+      case 'chmod': if (ok(ret)) push('stat', noDir(lit(args[0]))); break;
+      case 'fchmodat': case 'utimensat': if (ok(ret) && lit(args[1])) push('stat', at(args[0], lit(args[1]))); break;
+      case 'socket': if (inode(ret)) sockType.set(inode(ret), /SOCK_[A-Z]+/.exec(args[1])?.[0]); break;
+      case 'setsockopt': if (ok(ret) && args[2] === 'IPV6_V6ONLY') v6only.set(inode(args[0]), args[3] === '[1]'); break;
+      case 'getsockopt': {
+        const d = args[2] === 'SO_ERROR' && ok(ret) && pending.get(inode(args[0]));
+        if (d) { pending.delete(inode(args[0])); d.outcome = outcome(/^\[(\w+)\]/.exec(args[3])?.[1]); }
+        break;
+      }
+      case 'bind': case 'getsockname': {
+        const ino = inode(args[0]), [a] = inet(args.join(', '));
+        if (!ok(ret) || !ino || !a) break;
+        // A bind to port 0 lets the kernel pick; the getsockname after it says which.
+        if (name === 'bind' && !a.port) { unbound.add(ino); break; }
+        if (name === 'getsockname' && !unbound.delete(ino)) break;
+        bound.push({ t, type: sockType.get(ino), ...a, v6only: v6only.get(ino) ?? bindV6only() });
+        break;
+      }
       case 'connect': case 'sendto': case 'sendmsg': case 'sendmmsg': {
         const addr = network(args.join(', '));
         // A unix socket that isn't there (glibc probing nscd) is an absent path, not a connection.
         if (addr && addr.startsWith('unix:/') && !ok(ret)) push('absent', addr.slice(5));
         else if (addr) events.push({ kind: 'net', path: addr });
+        const ino = inode(args[0]);
+        for (const to of inet(args.join(', ')).filter((a) => isLoopback(a.host) && a.port)) {
+          const d = { t, type: sockType.get(ino), to: dialled(to), outcome: name !== 'connect' || ret === '0' ? 'ok' : outcome(/^-1 (\w+)/.exec(ret)?.[1]) };
+          if (/^-1 EINPROGRESS/.test(ret)) pending.set(ino, d);
+          dials.push(d);
+        }
         break;
       }
     }
   }
+  // Loopback is the run's own only where the run bound a same-type socket answering it before reaching it (or the
+  // reach was refused: a client waiting for its own server). Else it is a dev server, a CI service, a daemon.
+  for (const d of dials) {
+    if (!bound.some((b) => b.type && b.type === d.type && b.port === d.to.port && answers(b, d.to.host) && (b.t < d.t || d.outcome === 'refused'))) {
+      events.push({ kind: 'net', path: `${d.to.host.includes(':') ? `[${d.to.host}]` : d.to.host}:${d.to.port} (loopback, but no server the run started)` });
+    }
+  }
   return events;
 }
+
+const inode = (fd) => /socket:\[(\d+)\]/.exec(fd || '')?.[1];
+const outcome = (err) => (err === '0' ? 'ok' : err === 'ECONNREFUSED' ? 'refused' : 'unknown');
+const isLoopback = (h) => h.startsWith('127.') || h === '0.0.0.0' || h === '::1' || h === '::';
+// Every inet address in a call, IPv4-mapped IPv6 as plain IPv4.
+const inet = (s) => [...s.matchAll(NET)].filter((m) => m[2] || m[4]).map((m) => (m[2] ? { host: m[2], port: +m[1] } : { host: m[4].replace(/^::ffff:(?=\d+\.)/i, ''), port: +m[3] }));
+// Dialling a wildcard reaches loopback.
+const dialled = ({ host, port }) => ({ host: host === '0.0.0.0' ? '127.0.0.1' : host === '::' ? '::1' : host, port });
+// A wildcard bind answers its whole family; the IPv6 one IPv4 too, unless IPv6-only.
+const answers = (b, host) => b.host === host || (b.host === '0.0.0.0' && !host.includes(':')) || (b.host === '::' && (host.includes(':') || !b.v6only));
+let v6default;
+const bindV6only = () => (v6default ??= (() => { try { return readFileSync('/proc/sys/net/ipv6/bindv6only', 'utf8').trim() !== '0'; } catch { return true; } })());
 
 // The outside world: non-loopback IPs, unix sockets at file paths, abstract ones (@name: no file to hash).
 // Every destination counts (sendmmsg carries one per message).

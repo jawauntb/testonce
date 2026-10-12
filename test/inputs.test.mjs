@@ -182,3 +182,11 @@ test('env fingerprint, privateTmp: TMPDIR, TMP and TEMP are a fixed placeholder 
     }
   }
 });
+
+test('a write that keeps old bytes is a modified input, unless the run saw the path absent first', () => {
+  const kept = [{ kind: 'read', path: '/work/repo/log', kept: true }, { kind: 'write', path: '/work/repo/log' }];
+  assert.match(r(kept).uncacheable[0], /input modified by the run: log/);
+  const fresh = r([{ kind: 'absent', path: '/work/repo/log' }, ...kept]);
+  assert.deepEqual(fresh.uncacheable, []);
+  assert.equal(fresh.inputs.get('/work/repo/log'), 'absent');
+});

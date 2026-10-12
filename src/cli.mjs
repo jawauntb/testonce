@@ -8,7 +8,7 @@ export { bloomKey, queryKeys };
 import { traced, traceStatus } from './trace.mjs';
 import { doctor, noTraceMessage } from './doctor.mjs';
 import { splitLinuxFlag, wantsLinux, inContainer, runInLinux, realIo } from './linux.mjs';
-import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore } from './inputs.mjs';
+import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore, underIgnored } from './inputs.mjs';
 import { unlock } from './unlock.mjs';
 import { makePrivateTmp, removeTree, sweepSometimes } from './tmp.mjs';
 import { envFingerprint, PRIVATE_TMP_PLACEHOLDER, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
@@ -93,8 +93,9 @@ export async function run(args) {
   const cfg = loadConfig(root);
   name ??= argv.join(' ');
   const env = envFingerprint(process.env, cfg.env, { privateTmp: cfg.privateTmp });
-  // inputs: 3 = stat'ed files count by content, link targets are inputs; older records never match.
-  const key = createHash('sha256').update(JSON.stringify({ argv, cwd: keyOf(root, cwd), env: env.hash, platform: process.platform, arch: process.arch, inputs: 3 })).digest('hex');
+  // inputs: 4 = loopback is local only where the run bound it, kept bytes and create/remove calls are observed;
+  // older records never match.
+  const key = createHash('sha256').update(JSON.stringify({ argv, cwd: keyOf(root, cwd), env: env.hash, platform: process.platform, arch: process.arch, inputs: 4 })).digest('hex');
 
   const tr = traceStatus();
   if (!tr.ok) {
@@ -103,8 +104,10 @@ export async function run(args) {
   }
 
   if (!process.env.TESTONCE_NO_SWEEP) sweepSometimes(cfg.cacheDir);
-  if (cfg.noCache.some((g) => g === name || globRe(g).test(name))) {
-    say(`run ${name}: listed in noCache, always runs`);
+  // Every file under these is ignored, so a repo there would look input-free and skip forever.
+  const hidden = [root, cwd].find(underIgnored);
+  if (hidden || cfg.noCache.some((g) => g === name || globRe(g).test(name))) {
+    say(`run ${name}: ${hidden ? `${hidden} is under /proc, /sys, /dev or /run, which testonce never traces; not caching (move the repo)` : 'listed in noCache, always runs'}`);
     const t = cfg.privateTmp ? privateTmpOrNull() : null;
     try { return await passthrough(argv, cwd, t ? { ...process.env, ...t.env } : process.env); } finally { if (t) removeTree(t.base); }
   }

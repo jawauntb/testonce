@@ -451,3 +451,169 @@ int main(void) {
     assert.match(first.err, /not caching n: network: 192\.0\.2\.1:9/);
   } finally { r.done(); }
 });
+
+// ---- loopback: the run's own world only at an (address, port) the run itself bound ----
+// A server outside the run, in its own process (spawnSync blocks this one), answering each connection
+// with the current bytes of `answer`. `once`: answer one connection, then exit and free the port.
+const loopbackServer = (answer, { host = '127.0.0.1', port = 0, once = false } = {}) => new Promise((resolve, reject) => {
+  const src = `const fs = require('fs'); const s = require('net').createServer((c) => { c.on('error', () => {}).end(fs.readFileSync(${JSON.stringify(answer)})); ${once ? 's.close();' : ''} }).listen(${port}, ${JSON.stringify(host)}, () => console.log(s.address().port));`;
+  const child = spawn(process.execPath, ['-e', src], { stdio: ['ignore', 'pipe', 'inherit'] });
+  child.stdout.once('data', (d) => resolve({ port: Number(String(d).trim()), child, stop: () => new Promise((r) => { if (child.exitCode !== null) r(); else { child.once('exit', r); child.kill(); } }) }));
+  child.once('error', reject);
+});
+const dialer = (host, port, bindFirst = '') => `import net from 'node:net';
+${bindFirst}
+let got = '';
+net.connect(${port}, '${host}').on('data', (d) => { got += d; }).on('close', () => process.exit(got === 'ok' ? 0 : 1)).on('error', () => process.exit(1));\n`;
+
+test('soundness: a loopback server the run did not start (a dev server, a CI service, a daemon) is network, never cached', { skip }, async () => {
+  const answer = path.join(mkdtempSync(path.join(tmpdir(), 'sing-answer-')), 'a');
+  writeFileSync(answer, 'ok');
+  const outside = await loopbackServer(answer);
+  const { port } = outside;
+  // Same port, other loopback address: binding 127.0.0.2:P does not make 127.0.0.1:P the run's own.
+  const r = repo({
+    'plain.mjs': dialer('127.0.0.1', port),
+    'other-addr.mjs': dialer('127.0.0.1', port, `await new Promise((res) => net.createServer().listen(${port}, '127.0.0.2', res));`),
+  });
+  try {
+    const first = {};
+    for (const t of ['plain', 'other-addr']) { first[t] = r.sh('run', '--name', t, '--', 'node', `${t}.mjs`); assert.equal(first[t].code, 0, first[t].err); }
+    writeFileSync(answer, 'no'); // the server now answers differently; a plain run fails
+    const second = Object.fromEntries(['plain', 'other-addr'].map((t) => [t, r.sh('run', '--name', t, '--', 'node', `${t}.mjs`)]));
+    assert.deepEqual(Object.keys(second).filter((t) => /skip /.test(second[t].err)), [], 'wrong skips: the outside server now answers no');
+    for (const t in second) {
+      assert.equal(second[t].code, 1);
+      assert.match(first[t].err, new RegExp(`not caching ${t}: network: 127\\.0\\.0\\.1:${port} `), `${t}: ${first[t].err}`);
+    }
+  } finally { r.done(); await outside.stop(); rmSync(path.dirname(answer), { recursive: true, force: true }); }
+});
+
+test('soundness: a connect that got through before the run bound that address reached someone else', { skip }, async () => {
+  const answer = path.join(mkdtempSync(path.join(tmpdir(), 'sing-answer-')), 'a');
+  writeFileSync(answer, 'ok');
+  const outside = await loopbackServer(answer, { once: true });
+  const { port } = outside;
+  // Talk to the outside server, then (once it has gone) start a server of the run's own at the same address.
+  const script = `import net from 'node:net';
+let got = '';
+await new Promise((res, rej) => net.connect(${port}, '127.0.0.1').on('data', (d) => { got += d; }).on('close', res).on('error', rej));
+for (let i = 0; ; i++) {
+  try { await new Promise((res, rej) => { const s = net.createServer().once('error', rej).listen(${port}, '127.0.0.1', () => s.close(res)); }); break; }
+  catch (e) { if (i > 100) throw e; await new Promise((r) => setTimeout(r, 20)); }
+}
+process.exit(got === 'ok' ? 0 : 1);\n`;
+  const r = repo({ 'o.mjs': script });
+  try {
+    const first = r.sh('run', '--name', 'o', '--', 'node', 'o.mjs');
+    assert.equal(first.code, 0, first.err);
+    await outside.stop(); // nobody answers now; a plain run fails
+    const second = r.sh('run', '--name', 'o', '--', 'node', 'o.mjs');
+    assert.doesNotMatch(second.err, /skip o/, 'wrong skip: the outside server is gone');
+    assert.equal(second.code, 1);
+    assert.match(first.err, new RegExp(`not caching o: network: 127\\.0\\.0\\.1:${port} `));
+  } finally { r.done(); await outside.stop(); rmSync(path.dirname(answer), { recursive: true, force: true }); }
+});
+
+test('a loopback server the run starts itself stays local: bound first, or dialled until it is up', { skip }, () => {
+  const own = "import net from 'node:net'; const s = net.createServer((c) => c.end('ok')).listen(0, '127.0.0.1', () => { let got = ''; net.connect(s.address().port, '127.0.0.1').on('data', (d) => { got += d; }).on('close', () => process.exit(got === 'ok' ? 0 : 1)); });\n";
+  // Node's default listen() binds the IPv6 wildcard, which also answers 127.0.0.1 (supertest's pattern).
+  const wildcard = "import net from 'node:net'; const s = net.createServer((c) => c.end('ok')).listen(0, () => { let got = ''; net.connect(s.address().port, '127.0.0.1').on('data', (d) => { got += d; }).on('close', () => process.exit(got === 'ok' ? 0 : 1)); });\n";
+  const retry = `import net from 'node:net';
+const port = 40000 + (process.pid % 20000);
+setTimeout(() => net.createServer((c) => c.end('ok')).listen(port, '127.0.0.1'), 300);
+const dial = () => { let got = ''; net.connect(port, '127.0.0.1').on('data', (d) => { got += d; }).on('close', () => got && process.exit(got === 'ok' ? 0 : 1)).on('error', () => setTimeout(dial, 50)); };
+dial();\n`;
+  const r = repo({ 'own.mjs': own, 'wildcard.mjs': wildcard, 'retry.mjs': retry });
+  try {
+    for (const t of ['own', 'wildcard', 'retry']) {
+      assert.match(r.sh('run', '--name', t, '--', 'node', `${t}.mjs`).err, new RegExp(`cached ${t}`));
+      assert.match(r.sh('run', '--name', t, '--', 'node', `${t}.mjs`).err, new RegExp(`skip ${t}`));
+    }
+  } finally { r.done(); }
+});
+
+// ---- a write that keeps a file's old bytes, and calls that succeed only on what was there ----
+test('soundness: a write that keeps the bytes a file held before the run (append, a+, truncate to a length) makes them an input', { skip }, () => {
+  const r = repo({
+    'data.txt': 'ok',
+    'kept.txt': 'okay',
+    // Appends a line, then requires it to be the only one: a plain second run finds two.
+    'append.mjs': "import { appendFileSync, readFileSync } from 'node:fs'; appendFileSync('log.txt', 'x\\n'); process.exit(readFileSync('log.txt', 'utf8') === 'x\\n' ? 0 : 1);\n",
+    // O_RDWR|O_CREAT|O_APPEND, as sqlite and lock files open: the descriptor reads the fixture's bytes.
+    'rw.mjs': "import { openSync, readSync } from 'node:fs'; const b = Buffer.alloc(8); const n = readSync(openSync('data.txt', 'a+'), b, 0, 8, 0); process.exit(b.subarray(0, n).toString() === 'ok' ? 0 : 1);\n",
+    'trunc.py': "import os, sys\nos.truncate('kept.txt', 2)\nok = open('kept.txt').read() == 'ok'\nopen('kept.txt', 'w').write('okay')\nsys.exit(0 if ok else 1)\n",
+  });
+  try {
+    const cases = [['append', ['node', 'append.mjs'], null], ['rw', ['node', 'rw.mjs'], ['data.txt', 'no']]];
+    if (python) cases.push(['trunc', ['python3', 'trunc.py'], ['kept.txt', 'nope']]);
+    for (const [t, cmd] of cases) assert.equal(r.sh('run', '--name', t, '--', ...cmd).code, 0);
+    for (const [, , edit] of cases) if (edit) r.write(...edit);
+    const second = cases.map(([t, cmd]) => [t, r.sh('run', '--name', t, '--', ...cmd)]);
+    assert.deepEqual(second.filter(([t, o]) => o.err.includes(`skip ${t}`)).map(([t]) => t), [], 'wrong skips: a plain run fails now');
+    for (const [t, o] of second) assert.equal(o.code, 1, `${t}: must rerun and fail`);
+  } finally { r.done(); }
+});
+
+test('soundness: a call that succeeds only where a path was absent (mkdir, O_EXCL, symlink, link) or present (unlink, rmdir) observed it', { skip }, () => {
+  const r = repo({
+    'fixture.tmp': 'x',
+    'own.txt': 'x',
+    'del.mjs': "import { unlinkSync } from 'node:fs'; unlinkSync('fixture.tmp');\n",
+    'rmdir.mjs': "import { rmdirSync } from 'node:fs'; rmdirSync('empty');\n",
+    'mkdir.mjs': "import { mkdirSync } from 'node:fs'; mkdirSync('out');\n",
+    'excl.mjs': "import { writeFileSync } from 'node:fs'; writeFileSync('lock', 'x', { flag: 'wx' });\n",
+    'symlink.mjs': "import { symlinkSync } from 'node:fs'; symlinkSync('nowhere', 'l');\n",
+    'link.mjs': "import { writeFileSync, linkSync } from 'node:fs'; writeFileSync('made.txt', 'x'); linkSync('made.txt', 'hard.txt');\n",
+  });
+  try {
+    mkdirSync(path.join(r.dir, 'empty'));
+    const names = ['del', 'rmdir', 'mkdir', 'excl', 'symlink', 'link'];
+    for (const t of names) { const first = r.sh('run', '--name', t, '--', 'node', `${t}.mjs`); assert.equal(first.code, 0, `${t}: ${first.err}`); }
+    // Each first run changed what its call needs, so a plain second run fails (ENOENT or EEXIST).
+    const second = names.map((t) => [t, r.sh('run', '--name', t, '--', 'node', `${t}.mjs`)]);
+    assert.deepEqual(second.filter(([t, o]) => o.err.includes(`skip ${t}`)).map(([t]) => t), [], 'wrong skips: a plain run fails now');
+    for (const [t, o] of second) assert.equal(o.code, 1, `${t}: must rerun and fail`);
+  } finally { r.done(); }
+});
+
+test('soundness: changing a file\'s mode or times (chmod, utimes) keeps it an input', { skip }, () => {
+  const r = repo({
+    's.sh': '#!/bin/sh\nexit 0\n',
+    'f.txt': 'ok',
+    'chmod.mjs': "import { chmodSync } from 'node:fs'; import { spawnSync } from 'node:child_process'; chmodSync('s.sh', 0o755); process.exit(spawnSync('./s.sh').status);\n",
+    'utimes.mjs': "import { utimesSync, readFileSync } from 'node:fs'; utimesSync('f.txt', 1, 1); process.exit(readFileSync('f.txt', 'utf8') === 'ok' ? 0 : 1);\n",
+  });
+  try {
+    for (const t of ['chmod', 'utimes']) {
+      assert.match(r.sh('run', '--name', t, '--', 'node', `${t}.mjs`).err, new RegExp(`cached ${t}`));
+      assert.match(r.sh('run', '--name', t, '--', 'node', `${t}.mjs`).err, new RegExp(`skip ${t}`), `${t}: unchanged inputs still skip`);
+    }
+    r.write('s.sh', '#!/bin/sh\nexit 1\n');
+    r.write('f.txt', 'no');
+    const out = ['chmod', 'utimes'].map((t) => [t, r.sh('run', '--name', t, '--', 'node', `${t}.mjs`)]);
+    assert.deepEqual(out.filter(([t, o]) => o.err.includes(`skip ${t}`)).map(([t]) => t), [], 'wrong skips: the file changed');
+    for (const [t, o] of out) assert.equal(o.code, 1, `${t}: must rerun and fail`);
+  } finally { r.done(); }
+});
+
+// ---- a repo where every file would be ignored ----
+test('soundness: a repo under /dev, /proc, /sys or /run is never cached: every file it reads would be ignored', { skip: skip || (!existsSync('/dev/shm') && 'no /dev/shm') }, () => {
+  const dir = mkdtempSync('/dev/shm/sing-ignored-');
+  try {
+    spawnSync('git', ['init', '-q'], { cwd: dir });
+    writeFileSync(path.join(dir, 'add.mjs'), ADD);
+    writeFileSync(path.join(dir, 't.mjs'), TEST);
+    const sh = (...a) => { const o = spawnSync('node', [BIN, ...a], { cwd: dir, encoding: 'utf8', env: { ...process.env, TESTONCE_FULL: '' } }); return { code: o.status, err: o.stderr }; };
+    const first = sh('run', '--name', 't', '--', 'node', 't.mjs');
+    assert.equal(first.code, 0, first.err);
+    writeFileSync(path.join(dir, 'add.mjs'), 'export const add = (a, b) => a - b;\n');
+    const second = sh('run', '--name', 't', '--', 'node', 't.mjs');
+    assert.doesNotMatch(second.err, /skip t/, 'wrong skip: add.mjs changed');
+    assert.equal(second.code, 1, 'the edited source reruns the test');
+    assert.match(first.err, /run t: .* is under \/proc, \/sys, \/dev or \/run/);
+    const each = sh('each', 't.mjs', '--', 'node', '{}');
+    assert.equal(each.code, 1);
+    assert.match(each.err, /: 0 skipped,/);
+  } finally { rmSync(dir, { recursive: true, force: true }); }
+});
