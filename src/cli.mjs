@@ -8,7 +8,7 @@ export { bloomKey, queryKeys };
 import { traced, traceStatus } from './trace.mjs';
 import { doctor, noTraceMessage } from './doctor.mjs';
 import { splitLinuxFlag, wantsLinux, inContainer, runInLinux, realIo } from './linux.mjs';
-import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore, underIgnored } from './inputs.mjs';
+import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore, underIgnored, resetMemo } from './inputs.mjs';
 import { unlock } from './unlock.mjs';
 import { makePrivateTmp, removeTree, sweepSometimes } from './tmp.mjs';
 import { envFingerprint, PRIVATE_TMP_PLACEHOLDER, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
@@ -78,6 +78,41 @@ function whyMiss(rec, key, root, envNow, privateTmp) {
   return c ? `${c.key} changed` : 'changed';
 }
 
+// Why a test is never cached, or null. Every file under /proc, /sys, /dev and /run is ignored: a repo there would skip forever.
+function refusal(root, cwd, cfg, name) {
+  const hidden = [root, cwd].find(underIgnored);
+  if (hidden) return `${hidden} is under /proc, /sys, /dev or /run, which testonce never traces; not caching (move the repo)`;
+  return cfg.noCache.some((g) => g === name || globRe(g).test(name)) ? 'listed in noCache, always runs' : null;
+}
+
+// The skip decision, shared by `run` and `each`: a skip is recorded and returned as {skipped}; else nothing is written.
+function gate({ root, cwd, cfg, name, argv, full, procEnv = process.env }) {
+  const env = envFingerprint(procEnv, cfg.env, { privateTmp: cfg.privateTmp });
+  // inputs: 4 = loopback is local only where the run bound it, kept bytes and create/remove calls are observed;
+  // older records never match.
+  const key = createHash('sha256').update(JSON.stringify({ argv, cwd: keyOf(root, cwd), env: env.hash, platform: process.platform, arch: process.arch, inputs: 4 })).digest('hex');
+  const rec = load(cfg.cacheDir, name);
+  let audit = false, note;
+  if (!full && !rec.quarantined) {
+    const e = hit(rec, key, root);
+    if (e) {
+      rec.skips = (rec.skips ?? 0) + 1;
+      // Audit every Nth skip, and whenever the test hasn't really run for auditMaxAgeHours:
+      // that caps how long a clock- or randomness-dependent test can ride on an old pass.
+      const lastReal = [...(rec.history ?? [])].reverse().find((h) => !h.skipped)?.at ?? e.passedAt;
+      const stale = cfg.auditMaxAgeHours > 0 && Date.now() - Date.parse(lastReal) > cfg.auditMaxAgeHours * 3600_000;
+      audit = (cfg.auditEvery > 0 && rec.skips % cfg.auditEvery === 0) || stale;
+      if (!audit) {
+        rec.history = [...(rec.history ?? []), { at: new Date().toISOString(), ok: true, skipped: true, ms: 0, savedMs: e.ms }].slice(-30);
+        save(cfg.cacheDir, rec);
+        return { skipped: `skip ${name}: passed ${ago(e.passedAt)} on identical inputs (${e.inputs.length} files, same command and env)` };
+      }
+      note = `audit ${name}: inputs unchanged, running anyway (${stale ? `no real run in ${cfg.auditMaxAgeHours} h` : `every ${cfg.auditEvery}th skip is checked`})`;
+    } else if (rec.entries.length) note = `run ${name}: ${whyMiss(rec, key, root, env.names, cfg.privateTmp)}`;
+  }
+  return { rec, key, env, audit, note };
+}
+
 export async function run(args) {
   let name, full = process.env.TESTONCE_FULL === '1';
   const sep = args.indexOf('--');
@@ -92,10 +127,6 @@ export async function run(args) {
   const root = findRoot(cwd);
   const cfg = loadConfig(root);
   name ??= argv.join(' ');
-  const env = envFingerprint(process.env, cfg.env, { privateTmp: cfg.privateTmp });
-  // inputs: 4 = loopback is local only where the run bound it, kept bytes and create/remove calls are observed;
-  // older records never match.
-  const key = createHash('sha256').update(JSON.stringify({ argv, cwd: keyOf(root, cwd), env: env.hash, platform: process.platform, arch: process.arch, inputs: 4 })).digest('hex');
 
   const tr = traceStatus();
   if (!tr.ok) {
@@ -104,33 +135,16 @@ export async function run(args) {
   }
 
   if (!process.env.TESTONCE_NO_SWEEP) sweepSometimes(cfg.cacheDir);
-  // Every file under these is ignored, so a repo there would look input-free and skip forever.
-  const hidden = [root, cwd].find(underIgnored);
-  if (hidden || cfg.noCache.some((g) => g === name || globRe(g).test(name))) {
-    say(`run ${name}: ${hidden ? `${hidden} is under /proc, /sys, /dev or /run, which testonce never traces; not caching (move the repo)` : 'listed in noCache, always runs'}`);
+  const why = refusal(root, cwd, cfg, name);
+  if (why) {
+    say(`run ${name}: ${why}`);
     const t = cfg.privateTmp ? privateTmpOrNull() : null;
     try { return await passthrough(argv, cwd, t ? { ...process.env, ...t.env } : process.env); } finally { if (t) removeTree(t.base); }
   }
-  const rec = load(cfg.cacheDir, name);
-  let audit = false;
-  if (!full && !rec.quarantined) {
-    const e = hit(rec, key, root);
-    if (e) {
-      rec.skips = (rec.skips ?? 0) + 1;
-      // Audit every Nth skip, and whenever the test hasn't really run for auditMaxAgeHours:
-      // that caps how long a clock- or randomness-dependent test can ride on an old pass.
-      const lastReal = [...(rec.history ?? [])].reverse().find((h) => !h.skipped)?.at ?? e.passedAt;
-      const stale = cfg.auditMaxAgeHours > 0 && Date.now() - Date.parse(lastReal) > cfg.auditMaxAgeHours * 3600_000;
-      audit = (cfg.auditEvery > 0 && rec.skips % cfg.auditEvery === 0) || stale;
-      if (!audit) {
-        rec.history = [...(rec.history ?? []), { at: new Date().toISOString(), ok: true, skipped: true, ms: 0, savedMs: e.ms }].slice(-30);
-        save(cfg.cacheDir, rec);
-        say(`skip ${name}: passed ${ago(e.passedAt)} on identical inputs (${e.inputs.length} files, same command and env)`);
-        return 0;
-      }
-      say(`audit ${name}: inputs unchanged, running anyway (${stale ? `no real run in ${cfg.auditMaxAgeHours} h` : `every ${cfg.auditEvery}th skip is checked`})`);
-    } else if (rec.entries.length) say(`run ${name}: ${whyMiss(rec, key, root, env.names, cfg.privateTmp)}`);
-  }
+  const g = gate({ root, cwd, cfg, name, argv, full });
+  if (g.skipped) { say(g.skipped); return 0; }
+  if (g.note) say(g.note);
+  const { rec, key, env, audit } = g;
 
   const started = Date.now();
   // The test's own empty TMPDIR, removed when it ends however it ends (a SIGKILLed testonce leaves it to `sweep`).
@@ -245,12 +259,13 @@ export async function main(argv) {
       rest = args;
       if (!inContainer() && wantsLinux({ flag, env: process.env, cfg })) return runInLinux(cmd, rest, { root, cfg, io: await realIo(), say });
     }
-    if (cmd !== 'each' && cfg.trustStat) useHashStore(path.join(cfg.cacheDir, 'hashes.json'));
+    if (cfg.trustStat) useHashStore(path.join(cfg.cacheDir, 'hashes.json'));
   }
   try { return await dispatch(cmd, rest); } finally { flushHashStore(); }
 }
 
-// One cached run per file, N at a time. Each is its own process so traces never mix.
+// One cached run per file, N at a time. A skip is decided here at the file's turn, by run's gate on a fresh look at
+// the disk; anything else is its own `testonce run`, which decides again and records it, so traces never mix.
 export async function each(args) {
   const sep = args.indexOf('--');
   if (sep < 0) { say(USAGE); return 2; }
@@ -264,15 +279,20 @@ export async function each(args) {
   const template = args.slice(sep + 1);
   if (!template.some((a) => a.includes('{}'))) template.push('{}');
   const self = process.argv[1];
+  const cwd = process.cwd(), root = findRoot(cwd), cfg = loadConfig(root), full = process.env.TESTONCE_FULL === '1';
   const tr = traceStatus();
   if (!tr.ok) noTraceNotice(tr);
-  if (tr.ok) sweepSometimes(loadConfig(findRoot(process.cwd())).cacheDir);
+  if (tr.ok) sweepSometimes(cfg.cacheDir);
   const childEnv = { ...process.env, TESTONCE_NO_SWEEP: '1', ...(tr.ok ? {} : { TESTONCE_QUIET_NOTRACE: '1' }) };
   const tally = { skip: 0, ran: 0, failed: [] };
   const queue = [...files];
   const worker = async () => {
     for (let f; (f = queue.shift()) !== undefined;) {
       const argv = template.map((a) => a.replaceAll('{}', f));
+      if (tr.ok && !refusal(root, cwd, cfg, f)) {
+        resetMemo(); // fingerprints taken before an earlier test ran may be stale
+        if (gate({ root, cwd, cfg, name: f, argv, full, procEnv: childEnv }).skipped) { tally.skip++; say(`skip ${f}`); continue; }
+      }
       const out = await new Promise((resolve) => {
         const c = spawn(process.execPath, [self, 'run', '--name', f, '--', ...argv], { stdio: ['ignore', 'pipe', 'pipe'], env: childEnv });
         let text = '';

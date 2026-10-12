@@ -2,7 +2,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, existsSync, realpathSync, symlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -111,6 +112,82 @@ test('each runs files in parallel and reports skips and failures', { skip }, () 
     const second = r.sh('each', 'a.mjs', 'b.mjs', 'c.mjs', '--', 'node', '{}');
     assert.match(second.err, /3 files: 2 skipped, 1 ran, 1 failed/);
     assert.match(second.err, /FAIL c\.mjs/);
+  } finally { r.done(); }
+});
+
+test('soundness: each -j 1 decides a skip at the file\'s turn, after an earlier file changed its input', { skip }, () => {
+  const r = repo({ 'data.txt': 'original\n', 'a.sh': 'echo changed > data.txt\n', 'b.sh': 'grep -q original data.txt\n' });
+  try {
+    assert.match(r.sh('each', 'b.sh', '--', 'sh', '{}').err, /1 files: 0 skipped, 1 ran, 0 failed/);
+    assert.match(r.sh('each', 'b.sh', '--', 'sh', '{}').err, /1 files: 1 skipped, 0 ran, 0 failed/);
+    const out = r.sh('each', '-j', '1', 'a.sh', 'b.sh', '--', 'sh', '{}');
+    assert.doesNotMatch(out.err, /skip b\.sh/, 'wrong skip: a.sh changed data.txt before b.sh started');
+    assert.equal(out.code, 1, 'b.sh must rerun and fail');
+    assert.match(out.err, /FAIL b\.sh/);
+  } finally { r.done(); }
+});
+
+const recOf = (dir, name) => JSON.parse(readFileSync(path.join(dir, '.testonce', 'tests', createHash('sha256').update(name).digest('hex').slice(0, 32) + '.json'), 'utf8'));
+
+test('a skip in each records the same history, skip count and entries as a skip in run', { skip }, () => {
+  const r = repo({ 'add.mjs': ADD, 't.mjs': TEST });
+  try {
+    assert.match(r.sh('each', 't.mjs', '--', 'node', '{}').err, /0 skipped, 1 ran/);
+    const cached = recOf(r.dir, 't.mjs');
+    assert.match(r.sh('each', 't.mjs', '--', 'node', '{}').err, /1 skipped, 0 ran/);
+    const viaEach = recOf(r.dir, 't.mjs');
+    assert.match(r.sh('run', '--name', 't.mjs', '--', 'node', 't.mjs').err, /skip t\.mjs: passed .* on identical inputs/);
+    const viaRun = recOf(r.dir, 't.mjs');
+    assert.equal(viaEach.skips, 1);
+    assert.equal(viaRun.skips, 2);
+    assert.deepEqual(viaEach.entries, cached.entries, 'a skip leaves the recorded pass as it was');
+    assert.deepEqual(viaRun.entries, cached.entries);
+    const [, a, b] = viaRun.history.map(({ at, ...h }) => h);
+    assert.equal(viaRun.history.length, 3);
+    assert.deepEqual(a, { ok: true, skipped: true, ms: 0, savedMs: cached.entries[0].ms });
+    assert.deepEqual(a, b, 'each and run write the same skip row');
+    assert.deepEqual(viaEach.history, viaRun.history.slice(0, 2));
+    assert.match(r.sh('status').out, /cached\s+t\.mjs .*2 skips/);
+  } finally { r.done(); }
+});
+
+test('each audits a due skip instead of skipping it, and a failing audit quarantines the file', { skip: skip || (!existsSync('/dev/shm') && 'no /dev/shm') }, () => {
+  const flag = `/dev/shm/testonce-each-flag-${process.pid}`;
+  writeFileSync(flag, 'pass');
+  const r = repo({
+    'testonce.json': '{"auditEvery": 2}',
+    't.mjs': `import { readFileSync } from 'node:fs'; process.exit(readFileSync('${flag}', 'utf8') === 'pass' ? 0 : 1);\n`,
+  });
+  const each = () => r.sh('each', 't.mjs', '--', 'node', '{}');
+  try {
+    assert.match(each().err, /0 skipped, 1 ran, 0 failed/);
+    assert.match(each().err, /1 skipped, 0 ran/, 'skip 1');
+    assert.match(each().err, /0 skipped, 1 ran, 0 failed/, 'skip 2 is due an audit: it runs');
+    assert.equal(recOf(r.dir, 't.mjs').history.at(-1).audit, true);
+    assert.match(each().err, /1 skipped, 0 ran/, 'skip 3');
+    writeFileSync(flag, 'fail');
+    const audit = each();
+    assert.equal(audit.code, 1);
+    assert.match(audit.err, /0 skipped, 1 ran, 1 failed/);
+    assert.match(audit.out, /AUDIT MISMATCH t\.mjs/);
+    assert.equal(recOf(r.dir, 't.mjs').entries.length, 0, 'the failing audit removed the pass it contradicted');
+    writeFileSync(flag, 'pass');
+    assert.match(each().err, /0 skipped, 1 ran, 0 failed/, 'quarantined files always run');
+    assert.match(each().err, /0 skipped, 1 ran, 0 failed/);
+    const rec = recOf(r.dir, 't.mjs');
+    assert.match(rec.quarantined, /audit failed/);
+    assert.match(r.sh('status').out, /QUARANTINED\s+t\.mjs/);
+  } finally { r.done(); rmSync(flag, { force: true }); }
+});
+
+test('each audits a file that has not really run for auditMaxAgeHours', { skip }, () => {
+  const r = repo({ 'testonce.json': '{"auditEvery": 0, "auditMaxAgeHours": 0.00001}', 'add.mjs': ADD, 't.mjs': TEST });
+  try {
+    assert.match(r.sh('each', 't.mjs', '--', 'node', '{}').err, /0 skipped, 1 ran/);
+    assert.match(r.sh('each', 't.mjs', '--', 'node', '{}').err, /0 skipped, 1 ran/, 'older than 36 ms: audited, not skipped');
+    const rec = recOf(r.dir, 't.mjs');
+    assert.equal(rec.history.at(-1).audit, true);
+    assert.equal(rec.skips, 1);
   } finally { r.done(); }
 });
 

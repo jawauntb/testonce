@@ -133,7 +133,7 @@ and only the audit catches it.
 
 ## Measured
 
-Three measurements, each on one machine with one sample per cell, so treat them as examples, not guarantees.
+Four measurements, each on one machine with one or two samples per cell, so treat them as examples, not guarantees.
 
 **One suite, timed.** A 37-file Node test suite from one repository, on one 4-core machine. Plain `npm test` uses Node's own runner, which already runs files in parallel; the testonce rows use `-j4`. Plain `-j4` was not timed, so the rows are not a like-for-like comparison:
 
@@ -200,6 +200,22 @@ each file separately, which costs more than gbrain's CI (one `bun test` process 
 is not what their CI pays. We did not run the other 2,917 unit files, its Postgres tests or its serial tests.
 The file list and scripts are not yet in `bench/`; the selection rule above is the part to repeat.
 
+**Skips decided in one process (`each`), this repository's own suite.** One repo, one machine (4 cores,
+Node 22, strace 6.8), 2026-10-12, `node bin/testonce.mjs each test/*.test.mjs -- node --test {}` at the
+default `-j4`. Before: every file started its own `testonce run` process to decide its skip. After: `each`
+decides a skip itself, at the file's turn, with `run`'s code; a file that does not skip still gets its own
+`testonce run` process. Load average about 1 to 2 throughout.
+
+| | Before | After |
+|---|---|---|
+| Whole suite, first run (records; 24 ran) | 97.0 s | 101.4 s |
+| Whole suite, nothing changed (14 skipped, 10 ran), two samples | 103.3 s, 104.0 s | 104.5 s, 97.6 s |
+| Only the 14 files that skip, nothing changed, two samples | 0.60 s, 0.65 s | 0.15 s, 0.16 s |
+
+The whole suite did not get measurably faster: its wall time is set by the 10 files that always run
+(they call `git` or rewrite a file they read), and one of them, `test/addon-lane.test.mjs`, takes about
+95 s alone. The change only removes the process start for each skip: about 0.47 s less for 14 skips here.
+
 ## Install
 
 testonce needs Linux, Node.js 18 or newer, and `strace`. **On a Mac** use CI or `--linux` (a Linux container); see [docs/mac.md](docs/mac.md).
@@ -235,6 +251,8 @@ testonce mcp | api                                    # paid Connectors: local M
 ```
 
 `each` runs the command once per file, replacing `{}` with the file name. Each file is cached on its own.
+It decides each file's skip when that file's turn comes, not up front, so with `-j 1` a file whose input an
+earlier file changed reruns. A file that does not skip runs as its own `testonce run`.
 
 `TESTONCE_FULL=1` runs everything. Without strace (macOS, or a container without
 `CAP_SYS_PTRACE`), testonce runs every test normally, caches nothing, and says why once. On
