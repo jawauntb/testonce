@@ -2,6 +2,7 @@
 // A `false` answer is certain (no false negatives; proved in formal/Testonce/Bloom.lean).
 // A `true` answer may be a false positive, which only costs a re-run.
 import { createHash } from 'node:crypto';
+import path from 'node:path';
 
 // Index i of key x is (h1 + i*h2) mod m (Kirsch-Mitzenmacher double hashing).
 export function indices(key, m, k) {
@@ -35,3 +36,20 @@ export function has(filter, key) {
 
 export const encode = (f) => ({ m: f.m, k: f.k, bits: Buffer.from(f.bits).toString('base64') });
 export const decode = (o) => ({ m: o.m, k: o.k, bits: new Uint8Array(Buffer.from(o.bits, 'base64')) });
+
+// Directory listings are stored under their own key: a changed file can only change the listing
+// of a directory that contains it, never a plain stat of that directory.
+export const bloomKey = ([key, kind]) => (kind === 'list' ? `list:${key}` : key);
+
+// The bloom keys a changed path could hit: the path itself, and the listing of every ancestor.
+export function queryKeys(keys) {
+  const s = new Set();
+  for (const k of keys) {
+    s.add(k);
+    for (let d = path.dirname(k); ; d = path.dirname(d)) {
+      s.add(`list:${d}`);
+      if (d === '.' || d === '/') break;
+    }
+  }
+  return [...s];
+}

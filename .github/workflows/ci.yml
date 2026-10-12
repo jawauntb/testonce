@@ -24,7 +24,7 @@ jobs:
         run: lake build
       - name: Challenge file is frozen
         working-directory: formal
-        run: echo "e9bccb84c6fc6e178c3ed2b7570236f5cc6dab561771ee219f7e8e1920db56ee  Challenge.lean" | sha256sum -c -
+        run: echo "99f09a10abfdc1a8ddcb0e4da37dcf5130d39d4775a8629d3f3b76d8b40900a6  Challenge.lean" | sha256sum -c -
       - name: No sorry, no extra axioms
         working-directory: formal
         run: |

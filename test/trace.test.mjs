@@ -39,9 +39,9 @@ test('classifies directory listings, writes, renames and read-write opens', () =
     '1  renameat2(AT_FDCWD</r>, "a.tmp", AT_FDCWD</r>, "a", RENAME_NOREPLACE) = 0',
     '1  openat(AT_FDCWD</r>, "x\\"y.js", O_RDONLY) = 6</r/x"y.js>',
   ]), '/r');
-  assert.deepEqual(ev.map((e) => `${e.kind} ${e.path}`), [
+  assert.deepEqual(ev.map((e) => `${e.kind} ${e.path}${e.to ? ` -> ${e.to}` : ''}`), [
     'list /r/tests', 'write /r/out.txt', 'read /r/db.sqlite', 'write /r/db.sqlite',
-    'write /r/a.tmp', 'write /r/a', 'read /r/x"y.js',
+    'move /r/a.tmp -> /r/a', 'read /r/x"y.js',
   ]);
 });
 
@@ -61,7 +61,40 @@ test('a failed connect to a missing unix socket is an absent probe, not network'
   assert.deepEqual(ev, [{ kind: 'absent', path: '/var/run/nscd/socket' }]);
 });
 
-test('a stat that sees a symlink records no type, so the check that follows the link can match', () => {
+test('a stat that sees a symlink records no type, so the check that follows the link can match, and the link itself', () => {
   const ev = parse('1  newfstatat(AT_FDCWD</r>, "node_modules", {st_mode=S_IFLNK|0777, st_size=34, ...}, AT_SYMLINK_NOFOLLOW) = 0', '/r');
-  assert.deepEqual(ev, [{ kind: 'stat', path: '/r/node_modules' }]);
+  assert.deepEqual(ev, [{ kind: 'stat', path: '/r/node_modules' }, { kind: 'link', path: '/r/node_modules' }]);
+  assert.deepEqual(parse('1  readlink("cur", "a.txt", 4096) = 5', '/r'), [{ kind: 'stat', path: '/r/cur' }, { kind: 'link', path: '/r/cur' }]);
+});
+
+test('network: abstract unix sockets, and every destination of a sendmmsg', () => {
+  assert.equal(network('21<socket:[1]>, {sa_family=AF_UNIX, sun_path=@"some-server"}, 14'), 'unix:@some-server');
+  const two = (a, b) => `3, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr("${a}")}, msg_namelen=16, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=1}, {msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr("${b}")}, msg_namelen=16, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=1}], 2, 0`;
+  assert.equal(network(two('127.0.0.1', '192.0.2.1')), '192.0.2.1:9');
+  assert.equal(network(two('127.0.0.1', '127.0.0.2')), null);
+  assert.deepEqual(parse(`1  sendmmsg(${two('127.0.0.1', '192.0.2.1')}) = 2`, '/'), [{ kind: 'net', path: '192.0.2.1:9' }]);
+});
+
+test('rename, link and symlink: what moved, what got a second name, where a link points; failures are probes', () => {
+  const ev = parse(log([
+    '1  rename("a.part", "a")              = 0',
+    '1  renameat2(AT_FDCWD</r>, "x", AT_FDCWD</r>, "y", RENAME_EXCHANGE) = 0',
+    '1  rename("gone", "b")                = -1 ENOENT (No such file or directory)',
+    '1  rename("c", "/other/c")            = -1 EXDEV (Invalid cross-device link)',
+    '1  link("fixture.txt", "/t/h")        = 0',
+    '1  symlinkat("../lib", AT_FDCWD</r>, "t/l") = 0',
+    '1  symlink("/abs", "exists")          = -1 EEXIST (File exists)',
+    '1  openat(AT_FDCWD</r>, "t/l/a.js", O_RDONLY) = 3</lib/a.js>',
+    '1  newfstatat(AT_FDCWD</r>, "t/l/../m", 0x7ffd, 0) = -1 ENOENT (No such file or directory)',
+  ]), '/r');
+  assert.deepEqual(ev, [
+    { kind: 'move', path: '/r/a.part', to: '/r/a' },
+    { kind: 'move', path: '/r/x', to: '/r/y' }, { kind: 'move', path: '/r/y', to: '/r/x' },
+    { kind: 'absent', path: '/r/gone' },
+    { kind: 'hardlink', path: '/t/h', from: '/r/fixture.txt' },
+    { kind: 'symlink', path: '/r/t/l', target: '../lib' },
+    { kind: 'stat', path: '/r/exists' },
+    { kind: 'read', path: '/r/t/l/a.js' }, { kind: 'read', path: '/lib/a.js' },
+    { kind: 'absent', path: '/r/t/m', via: '/r/t/l/../m' },
+  ]);
 });

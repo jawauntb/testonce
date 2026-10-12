@@ -65,6 +65,27 @@ If a held-out run exposes a bug, fix it on a general principle, then re-run both
 that the held-out set was consulted (once consulted, a subject stops being held-out for that change and a new
 held-out subject should be added). A false skip found anywhere is a bug regardless of split.
 
+## RTL subjects (held-out, run on GitHub-hosted runners)
+
+Three public hardware projects, each with a different kind of test, replayed by `.github/workflows/rtl-bench.yml`
+(one job per subject, `ubuntu-24.04`, 4 cores). Nothing in `src/` was changed or tuned for them.
+
+| Subject | What one test is | Tools | Fault rule |
+|---|---|---|---|
+| `verilog-axis` (alexforencich) | one cocotb test file, `pytest tb/<module>/test_<module>.py`, simulated with Icarus | iverilog, Python 3.10, cocotb versions pinned by the subject's `tox.ini` | prepend an undefined macro to a file in `rtl/*.v` |
+| `wb2axip` (ZipCPU) | one SymbiYosys proof file, `sby -f bench/formal/<name>.sby` (all its tasks) | latest oss-cad-suite build (tag and sha256 recorded) | same, `rtl/*.v` |
+| `openc910` (XuanTie C910) | one `smart_run` case: build the core with Verilator, build the case with XuanTie GCC, simulate, pass on `TEST PASS` (`bench/rtl/openc910-case.sh`) | Verilator, XuanTie GCC from its GitHub release (URL and sha256 recorded) | same, `C910_RTL_FACTORY/gen_rtl/cpu/rtl/*.v` |
+
+A fault here is a compile error in one RTL file, so a run that detects it shows that testonce saw the file as an
+input of every test that compiles it. `verilog-axis` and `wb2axip` keep the first 24 and 20 test files in name
+order that pass at the newest replayed commit within 300 s and 240 s; `openc910` runs four cases (`hello_world`, `ISA_IMAC`, `ISA_AMO`, `csr`), one job each; `ISA_FP` is left out because its program uses half-precision instructions that the public prebuilt XuanTie assembler rejects.
+
+Each job writes `out/<subject>.json` (every row), `out/versions-*.txt` and `out/receipt-*.json`
+(`bench/rtl/receipt.mjs`): the commits, the headline numbers, the sha256 of the results, of the harness and of
+the wrapper scripts, the tool versions and download hashes, the machine, and the Actions run URL. The job uploads
+them as an artifact and pushes them to branch `rtl-bench-results/<run id>-<subject>`. To check a receipt, re-hash
+the files it names, or rerun its `rerun` command at its `testonce_git_head` with the same tools.
+
 ## Subjects skipped, and why
 
 | Subject | Reason |

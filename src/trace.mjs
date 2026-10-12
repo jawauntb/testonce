@@ -1,13 +1,14 @@
 // Run a command under strace and turn the syscall log into an access record:
 // which paths it read, listed, probed and wrote, which programs it ran, and where it connected.
 import { spawn, spawnSync } from 'node:child_process';
-import { readFileSync, rmSync, mkdtempSync, existsSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { readFileSync, writeFileSync, rmSync, mkdtempSync, existsSync, readdirSync } from 'node:fs';
+import { tmpdir, constants } from 'node:os';
+import { MARKER } from './tmp.mjs';
 import path from 'node:path';
 
 const SYSCALLS = [
   'open', 'openat', 'openat2', 'creat', 'stat', 'lstat', 'newfstatat', 'statx', 'access', 'faccessat',
-  'faccessat2', 'readlink', 'readlinkat', 'execve', 'execveat', 'connect', 'sendto', 'sendmsg',
+  'faccessat2', 'readlink', 'readlinkat', 'execve', 'execveat', 'connect', 'sendto', 'sendmsg', 'sendmmsg',
   'rename', 'renameat', 'renameat2', 'unlink', 'unlinkat', 'mkdir', 'mkdirat', 'rmdir', 'truncate',
   'link', 'linkat', 'symlink', 'symlinkat', 'chmod', 'fchmodat', 'utimensat',
   'chdir', 'fchdir', 'clone', 'clone3', 'fork', 'vfork',
@@ -48,18 +49,37 @@ export const canTrace = () => traceStatus().ok;
 
 export async function traced(argv, { cwd = process.cwd(), env = process.env } = {}) {
   const dir = mkdtempSync(path.join(tmpdir(), 'testonce-'));
+  writeFileSync(path.join(dir, MARKER), ''); // so a log left by a killed testonce is swept (src/tmp.mjs)
   const log = path.join(dir, 'strace.log');
   const args = ['-f', '-y', '-qq', '-s', '65535', '-e', 'signal=none', '-e', `trace=${SYSCALLS.join(',')}`, '-o', log];
   if (probeSeccomp().ok) args.unshift('--seccomp-bpf');
+  // A signal to testonce goes to the test too; testonce waits for it to stop, so the caller can clean up.
+  // (strace -o FILE blocks fatal signals itself, so it is the traced processes that are signalled.)
+  let signal = null;
+  const SIGNALS = ['SIGINT', 'SIGTERM', 'SIGHUP'];
   const code = await new Promise((resolve) => {
     const child = spawn('strace', [...args, '--', ...argv], { cwd, env, stdio: 'inherit' });
-    child.on('exit', (c, sig) => resolve(sig ? 128 + 1 : c ?? 1));
-    child.on('error', () => resolve(127));
+    const forward = (sig) => { signal = sig; signalTracees(child.pid, sig); };
+    for (const s of SIGNALS) process.on(s, forward);
+    const done = (c) => { for (const s of SIGNALS) process.off(s, forward); resolve(c); };
+    child.on('exit', (c, sig) => done(signal ? 128 + constants.signals[signal] : sig ? 128 + 1 : c ?? 1));
+    child.on('error', () => done(127));
   });
   let text = '';
   try { text = readFileSync(log, 'utf8'); } catch {}
   rmSync(dir, { recursive: true, force: true });
-  return { code, accesses: parse(text, cwd) };
+  return { code, signal, accesses: parse(text, cwd) };
+}
+
+// Every process this strace is tracing right now: their TracerPid is strace's pid, so no stray pid is hit.
+function signalTracees(tracer, sig) {
+  let pids = [];
+  try { pids = readdirSync('/proc').filter((p) => /^\d+$/.test(p)); } catch {}
+  for (const p of pids) {
+    try {
+      if (/^TracerPid:\s*(\d+)$/m.exec(readFileSync(`/proc/${p}/status`, 'utf8'))?.[1] === String(tracer)) process.kill(+p, sig);
+    } catch {}
+  }
 }
 
 // ---- parsing ----
@@ -97,7 +117,12 @@ export function splitArgs(s) {
 }
 
 const lit = (a) => (a && a[0] === '"' ? str(a, 0)[0] : null);
-const fdPath = (a) => { const m = /<(.*)>$/.exec(a || ''); return m ? m[1] : null; };
+// strace -y prints a decoded fd path in <...>, escaping bytes such as `>` as octal (\76) or hex.
+const unesc = (s) => s.replace(/\\(x[0-9a-fA-F]{2}|[0-7]{1,3}|.)/g, (_, c) =>
+  c[0] === 'x' && c.length === 3 ? String.fromCharCode(parseInt(c.slice(1), 16))
+    : /^[0-7]+$/.test(c) ? String.fromCharCode(parseInt(c, 8))
+      : c === 'n' ? '\n' : c === 't' ? '\t' : c === 'r' ? '\r' : c);
+const fdPath = (a) => { const m = /<(.*)>$/.exec(a || ''); return m ? unesc(m[1]) : null; };
 
 // Join "<unfinished ...>" / "<... resumed>" fragments and yield {pid, name, args, ret}.
 export function* calls(text) {
@@ -144,7 +169,16 @@ export function parse(text, cwd) {
     return path.resolve(base ?? here(), p);
   };
   const noDir = (p) => (p == null ? null : path.resolve(here(), p)); // non-*at calls carry no dirfd annotation
+  // path.resolve folds `..` lexically. Keep the spelling too (`via`), so src/inputs.mjs can follow a symlink the
+  // run created before the `..`, as the kernel does. Opens need no help: their fd path is the kernel's answer.
+  const via = (rawArg, dirArg) => {
+    const p = lit(rawArg);
+    if (p == null || !/(^|\/)\.\.(\/|$)/.test(p)) return {};
+    return { via: p[0] === '/' ? p : `${(dirArg && fdPath(dirArg)) || here()}/${p}` };
+  };
   const push = (kind, p, extra) => { if (p) events.push({ kind, path: p, ...extra }); };
+  // A readlink, or a no-follow stat that saw a link, looked at the link itself: where it points is an input too.
+  const stat = (name, args, p, v) => { push('stat', p, { ...typeFrom(args), ...v }); if (name.startsWith('readlink') || /_mode=S_IFLNK/.test(args.join())) push('link', p, v); };
 
   for (const c of calls(text)) {
     const { name, args, ret } = c;
@@ -157,44 +191,73 @@ export function parse(text, cwd) {
       case 'open': case 'openat': case 'openat2': case 'creat': {
         const p = name === 'open' || name === 'creat' ? noDir(lit(args[0])) : at(args[0], lit(args[1]));
         const flags = name === 'creat' ? 'O_WRONLY|O_CREAT|O_TRUNC' : (name === 'open' ? args[1] : args[2]) || '';
-        if (!ok(ret)) { if (enoent(ret)) push('absent', p); continue; }
-        if (flags.includes('O_PATH')) push('stat', p);
-        else if (/O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND/.test(flags)) {
-          if (flags.includes('O_RDWR') && !/O_CREAT|O_TRUNC/.test(flags)) push('read', p);
-          push('write', p);
-        } else push(flags.includes('O_DIRECTORY') ? 'list' : 'read', p);
+        if (!ok(ret)) { if (enoent(ret)) push('absent', p, name === 'open' || name === 'creat' ? via(args[0]) : via(args[1], args[0])); continue; }
+        // The opened fd's path, as the kernel resolved it (`-y`): through any symlink, including one the run made.
+        const real = fdPath(ret);
+        for (const q of real && real[0] === '/' && real !== p ? [p, real] : [p]) {
+          if (flags.includes('O_PATH')) push('stat', q);
+          else if (/O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND/.test(flags)) {
+            if (flags.includes('O_RDWR') && !/O_CREAT|O_TRUNC/.test(flags)) push('read', q);
+            push('write', q);
+          } else push(flags.includes('O_DIRECTORY') ? 'list' : 'read', q);
+        }
         break;
       }
       case 'stat': case 'lstat': case 'access': case 'readlink': {
         const p = noDir(lit(args[0]));
-        if (ok(ret)) push('stat', p, typeFrom(args)); else if (enoent(ret)) push('absent', p);
+        if (ok(ret)) stat(name, args, p, via(args[0])); else if (enoent(ret)) push('absent', p, via(args[0]));
         break;
       }
       case 'newfstatat': case 'statx': case 'faccessat': case 'faccessat2': case 'readlinkat': {
         const rel = lit(args[1]);
         if (rel === '') continue; // fd-relative (AT_EMPTY_PATH): already counted at open
         const p = at(args[0], rel);
-        if (ok(ret)) push('stat', p, typeFrom(args)); else if (enoent(ret)) push('absent', p);
+        if (ok(ret)) stat(name, args, p, via(args[1], args[0])); else if (enoent(ret)) push('absent', p, via(args[1], args[0]));
         break;
       }
       case 'execve': case 'execveat': {
         const p = name === 'execve' ? noDir(lit(args[0])) : at(args[0], lit(args[1]));
-        if (ok(ret)) push('exec', p); else if (enoent(ret)) push('absent', p);
+        const v = name === 'execve' ? via(args[0]) : via(args[1], args[0]);
+        if (ok(ret)) push('exec', p, v); else if (enoent(ret)) push('absent', p, v);
         break;
       }
-      case 'rename': case 'link': case 'symlink':
-        push('write', noDir(lit(args[0]))); push('write', noDir(lit(args[1]))); break;
-      case 'renameat': case 'renameat2': case 'linkat':
-        push('write', at(args[0], lit(args[1]))); push('write', at(args[2], lit(args[3]))); break;
-      case 'symlinkat': push('write', at(args[1], lit(args[2]))); break;
+      // A rename moves content (`move`); a hard link gives a file a second name (`hardlink`); a symlink
+      // redirects later lookups (`symlink`, target kept as written). src/inputs.mjs decides what each means.
+      case 'rename': case 'renameat': case 'renameat2': {
+        const [from, to] = name === 'rename' ? [noDir(lit(args[0])), noDir(lit(args[1]))] : [at(args[0], lit(args[1])), at(args[2], lit(args[3]))];
+        if (!from || !to) break;
+        if (ok(ret)) {
+          events.push({ kind: 'move', path: from, to });
+          if (/RENAME_EXCHANGE/.test(args[4] || '')) events.push({ kind: 'move', path: to, to: from });
+        } else if (enoent(ret)) push('absent', from);
+        else if (/^-1 (EEXIST|ENOTEMPTY)/.test(ret)) push('stat', to);
+        break;
+      }
+      case 'link': case 'linkat': {
+        const [from, to] = name === 'link' ? [noDir(lit(args[0])), noDir(lit(args[1]))] : [at(args[0], lit(args[1])), at(args[2], lit(args[3]))];
+        if (!from || !to) break;
+        if (ok(ret)) events.push({ kind: 'hardlink', path: to, from });
+        else if (enoent(ret)) push('absent', from);
+        else if (/^-1 EEXIST/.test(ret)) push('stat', to);
+        break;
+      }
+      case 'symlink': case 'symlinkat': {
+        const target = lit(args[0]);
+        const link = name === 'symlink' ? noDir(lit(args[1])) : at(args[1], lit(args[2]));
+        if (!link) break;
+        if (ok(ret)) events.push({ kind: 'symlink', path: link, target });
+        else if (/^-1 EEXIST/.test(ret)) push('stat', link);
+        else if (enoent(ret)) push('absent', path.dirname(link));
+        break;
+      }
       case 'unlink': case 'rmdir': case 'mkdir': case 'truncate': case 'chmod':
         if (ok(ret)) push('write', noDir(lit(args[0]))); break;
       case 'unlinkat': case 'mkdirat': case 'fchmodat': case 'utimensat':
         if (ok(ret) && lit(args[1])) push('write', at(args[0], lit(args[1]))); break;
-      case 'connect': case 'sendto': case 'sendmsg': {
+      case 'connect': case 'sendto': case 'sendmsg': case 'sendmmsg': {
         const addr = network(args.join(', '));
         // A unix socket that isn't there (glibc probing nscd) is an absent path, not a connection.
-        if (addr && addr.startsWith('unix:') && !ok(ret)) push('absent', addr.slice(5));
+        if (addr && addr.startsWith('unix:/') && !ok(ret)) push('absent', addr.slice(5));
         else if (addr) events.push({ kind: 'net', path: addr });
         break;
       }
@@ -203,13 +266,14 @@ export function parse(text, cwd) {
   return events;
 }
 
-// Non-loopback IP destinations, and unix sockets at filesystem paths, count as the outside world.
+// The outside world: non-loopback IPs, unix sockets at file paths, abstract ones (@name: no file to hash).
+// Every destination counts (sendmmsg carries one per message).
+const NET = /sa_family=AF_INET,.*?sin_port=htons\((\d+)\).*?inet_addr\("([^"]+)"\)|sa_family=AF_INET6,.*?sin6_port=htons\((\d+)\).*?inet_pton\(AF_INET6, "([^"]+)"|sa_family=AF_UNIX, sun_path=(@?)"([^"]+)"/g;
 export function network(s) {
-  let m = /sa_family=AF_INET,.*?sin_port=htons\((\d+)\).*?inet_addr\("([^"]+)"\)/.exec(s);
-  if (m) return m[2].startsWith('127.') || m[2] === '0.0.0.0' ? null : `${m[2]}:${m[1]}`;
-  m = /sa_family=AF_INET6,.*?sin6_port=htons\((\d+)\).*?inet_pton\(AF_INET6, "([^"]+)"/.exec(s);
-  if (m) return m[2] === '::1' || m[2] === '::' || m[2].startsWith('::ffff:127.') ? null : `[${m[2]}]:${m[1]}`;
-  m = /sa_family=AF_UNIX, sun_path="([^"]+)"/.exec(s);
-  if (m && m[1][0] === '/') return `unix:${m[1]}`;
+  for (const m of s.matchAll(NET)) {
+    if (m[2] && !(m[2].startsWith('127.') || m[2] === '0.0.0.0')) return `${m[2]}:${m[1]}`;
+    if (m[4] && !(m[4] === '::1' || m[4] === '::' || m[4].startsWith('::ffff:127.'))) return `[${m[4]}]:${m[3]}`;
+    if (m[6] && (m[5] || m[6][0] === '/')) return `unix:${m[5]}${m[6]}`;
+  }
   return null;
 }

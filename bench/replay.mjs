@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Outside-checked soundness benchmark for testonce. See bench/README.md.
-//   node bench/replay.mjs <subject> [--commits N] [--budget-min M] [--jobs J] [--faults K] [--out DIR]
+//   node bench/replay.mjs <subject> [--commits N] [--budget-min M] [--jobs J] [--faults K] [--out DIR] [--tests a,b] [--tag T]
 // The oracle is the repo's own test command run plainly. testonce is never consulted for ground truth.
 import { spawn, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, symlinkSync, readdirSync } from 'node:fs';
@@ -22,10 +22,14 @@ const FAULTS = +opt('faults', 3);
 const OUT = opt('out', path.join(HERE, 'results'));
 const WORK = `/tmp/claude-0/bench/${subject}`;
 const REPO = path.join(WORK, 'repo');
-const FILE_TIMEOUT_MS = 120000;
+const FILE_TIMEOUT_MS = (S.timeoutSec ?? 120) * 1000;
+const ONLY = opt('tests', null)?.split(',');
+const NAME = subject + (opt('tag', '') ? '-' + opt('tag', '') : '');
 
 // Minimal env: no secrets reach any test, and the env is byte-stable across commits so skips are possible.
-const ENV = { PATH: process.env.PATH, HOME: path.join(WORK, 'home'), TMPDIR: path.join(WORK, 'tmp'), LANG: 'C.UTF-8', TESTONCE_CACHE_DIR: path.join(WORK, 'cache') };
+// A subject may add fixed variables; a value written "$NAME" is copied from the harness's own environment (a tool path).
+const ENV = { PATH: process.env.PATH, HOME: path.join(WORK, 'home'), TMPDIR: path.join(WORK, 'tmp'), LANG: 'C.UTF-8', TESTONCE_CACHE_DIR: path.join(WORK, 'cache'),
+  ...Object.fromEntries(Object.entries(S.env ?? {}).map(([k, v]) => [k, v.startsWith('$') ? process.env[v.slice(1)] ?? '' : v])) };
 const git = (...a) => execFileSync('git', a, { cwd: REPO, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
 const t0 = Date.now();
 const log = (m) => console.error(`[${((Date.now() - t0) / 1000).toFixed(0)}s] ${subject}: ${m}`);
@@ -35,7 +39,7 @@ async function pool(items, j, fn) {
   await Promise.all(Array.from({ length: Math.min(j, items.length) }, async () => { while (i < items.length) { const k = i++; out[k] = await fn(items[k], k); } }));
   return out;
 }
-const cmdFor = (f) => S.cmd.map((c) => (c === '{}' ? f : c));
+const cmdFor = (f) => S.cmd.map((c) => (c === '{}' ? f : c.replaceAll('{bench}', HERE)));
 
 function exec(argvv, { capture = false, timeoutMs = FILE_TIMEOUT_MS } = {}) {
   return new Promise((resolve) => {
@@ -49,6 +53,9 @@ function exec(argvv, { capture = false, timeoutMs = FILE_TIMEOUT_MS } = {}) {
   });
 }
 
+// The last stderr lines of a failing run (testonce's own lines dropped), kept in the results so a failure can be read later.
+const tail = (r) => (r.code === 0 ? undefined : r.err.split('\n').filter((l) => l && !l.startsWith('testonce: ')).slice(-12).join('\n'));
+
 function parseSing(err, name) {
   const lines = err.split('\n').filter((l) => l.startsWith('testonce: '));
   const mine = lines.filter((l) => l.includes(` ${name}:`) || l.includes(` ${name} `));
@@ -56,14 +63,21 @@ function parseSing(err, name) {
   const nc = mine.find((l) => l.startsWith(`testonce: not caching ${name}:`));
   let reason = null;
   if (nc) reason = nc.slice(`testonce: not caching ${name}: `.length).replace(/ \(\+\d+ more.*$/, '').replace(/^(input modified by the run): .*/, '$1').replace(/^(network): .*/, '$1');
-  return { skipped: has('skip'), audited: has('audit'), cached: has('cached'), reason, auditMismatch: lines.some((l) => l.includes('AUDIT MISMATCH')) };
+  return { skipped: has('skip'), audited: has('audit'), cached: has('cached'), reason, reasonDetail: nc ? nc.slice(`testonce: not caching ${name}: `.length, 400) : null, auditMismatch: lines.some((l) => l.includes('AUDIT MISMATCH')) };
 }
 
-const resetTree = () => { git('checkout', '-q', '-f', '--detach', ...(resetTree.sha ? [resetTree.sha] : [])); git('clean', '-fdxq', '-e', 'node_modules'); };
-const cleanUntracked = () => git('clean', '-fdxq', '-e', 'node_modules');
+// A subject variant may carry the testonce.json a user would add (`testonceConfig`); it stays in the scratch clone across resets.
+const KEEP = ['-e', 'node_modules', ...(S.testonceConfig ? ['-e', 'testonce.json'] : [])];
+const resetTree = () => { git('checkout', '-q', '-f', '--detach', ...(resetTree.sha ? [resetTree.sha] : [])); git('clean', '-fdxq', ...KEEP); };
+const cleanUntracked = () => git('clean', '-fdxq', ...KEEP);
 const checkout = (sha) => { resetTree.sha = sha; resetTree(); };
 
+// A glob with a wildcard in its directory part (tb/*/test_*.py) is matched over the whole tree; `**/` spans directories.
+const globRe = (g) => new RegExp('^' + g.split(/(\*\*\/|\*|\?)/).map((t) => (t === '**/' ? '(?:.*/)?' : t === '*' ? '[^/]*' : t === '?' ? '[^/]' : t.replace(/[.+^${}()|[\]\\]/g, '\\$&'))).join('') + '$');
+const treeMatch = (sha, g) => { const re = globRe(g); return git('ls-tree', '-r', '--name-only', sha).split('\n').filter((f) => re.test(f)).sort(); };
 const filesAt = (sha) => {
+  if (S.tests) return S.tests.filter((t) => !ONLY || ONLY.includes(t));
+  if (/[*?]/.test(path.dirname(S.testGlob))) return treeMatch(sha, S.testGlob);
   const dir = path.dirname(S.testGlob), suffix = path.basename(S.testGlob).replace('*', '');
   return git('ls-tree', '--name-only', sha, dir + '/').split('\n').filter((f) => f.endsWith(suffix)).sort();
 };
@@ -72,21 +86,23 @@ async function singPass(files) {
   const t = Date.now();
   const rs = await pool(files, J, async (f) => {
     const r = await exec(['node', SING, 'run', '--name', f, '--', ...cmdFor(f)], { capture: true });
-    return { file: f, code: r.code, ms: r.ms, ...parseSing(r.err, f) };
+    return { file: f, code: r.code, ms: r.ms, ...parseSing(r.err, f), errTail: tail(r) };
   });
   return { wallMs: Date.now() - t, results: rs };
 }
 async function oraclePass(files) {
   const t = Date.now();
-  const rs = await pool(files, J, async (f) => { const r = await exec(cmdFor(f)); return { file: f, code: r.code, ms: r.ms }; });
+  const rs = await pool(files, J, async (f) => { const r = await exec(cmdFor(f), { capture: true }); return { file: f, code: r.code, ms: r.ms, errTail: tail(r) }; });
   return { wallMs: Date.now() - t, results: rs };
 }
 
 // ---- setup ----
 rmSync(WORK, { recursive: true, force: true });
 for (const d of ['home', 'tmp', 'cache']) mkdirSync(path.join(WORK, d), { recursive: true });
-execFileSync('git', ['clone', '--local', '--no-checkout', '-q', S.repo, REPO]);
+if (S.url) execFileSync('git', ['clone', '--no-checkout', '-q', '--filter=blob:none', S.url, REPO]);
+else execFileSync('git', ['clone', '--local', '--no-checkout', '-q', S.repo, REPO]);
 if (S.nodeModules) { symlinkSync(path.join(S.repo, 'node_modules'), path.join(REPO, 'node_modules')); writeFileSync(path.join(REPO, '.git/info/exclude'), 'node_modules\n'); }
+if (S.testonceConfig) writeFileSync(path.join(REPO, 'testonce.json'), JSON.stringify(S.testonceConfig) + '\n');
 const head = git('rev-parse', 'HEAD').trim();
 const commits = git('rev-list', '--first-parent', '-n', String(N), head).trim().split('\n').reverse();
 log(`${commits.length} commits ${commits[0].slice(0, 7)}..${commits.at(-1).slice(0, 7)}`);
@@ -104,7 +120,7 @@ if (S.select) {
     for (const r of rs) if (r.code === 0 && selection.length < S.select.maxFiles) selection.push(r.f);
   }
   log(`selected ${selection.length}/${all.length} files (passing at newest commit, <${S.select.timeoutSec}s)`);
-  writeFileSync(path.join(OUT, `selection-${subject}.json`), JSON.stringify({ subject, newest: commits.at(-1), rule: `first ${S.select.maxFiles} files in name order whose oracle exit is 0 within ${S.select.timeoutSec}s at the newest replayed commit`, files: selection }, null, 1));
+  writeFileSync(path.join(OUT, `selection-${NAME}.json`), JSON.stringify({ subject, newest: commits.at(-1), rule: `first ${S.select.maxFiles} files in name order whose oracle exit is 0 within ${S.select.timeoutSec}s at the newest replayed commit`, files: selection }, null, 1));
 }
 const listAt = (sha) => { const f = filesAt(sha); return selection ? f.filter((x) => selection.includes(x)) : f; };
 
@@ -127,11 +143,12 @@ for (let ci = 0; ci < commits.length; ci++) {
     const o = om.get(s.file);
     let confirmed = null;
     if (s.skipped && o.code !== 0) { confirmed = (await exec(cmdFor(s.file))).code !== 0; }
-    rows.push({ file: s.file, skipped: s.skipped, audited: s.audited, cached: s.cached, reason: s.reason, singCode: s.code, singMs: s.ms, oracleCode: o.code, oracleMs: o.ms, falseSkip: s.skipped && o.code !== 0, falseSkipConfirmed: confirmed, divergent: !s.skipped && s.code !== o.code, auditMismatch: s.auditMismatch });
+    rows.push({ file: s.file, skipped: s.skipped, audited: s.audited, cached: s.cached, reason: s.reason, reasonDetail: s.reasonDetail, singCode: s.code, singMs: s.ms, oracleCode: o.code, oracleMs: o.ms, singErr: s.errTail, oracleErr: o.errTail, falseSkip: s.skipped && o.code !== 0, falseSkipConfirmed: confirmed, divergent: !s.skipped && s.code !== o.code, auditMismatch: s.auditMismatch });
   }
   oracleBy.set(sha, om);
   const rec = { sha, index: ci, files: files.length, singWallMs: sing.wallMs, oracleWallMs: orc.wallMs, rows };
   perCommit.push(rec);
+  writeFileSync(path.join(OUT, `${NAME}.partial.json`), JSON.stringify({ partial: true, commits: perCommit }, null, 1)); // survives a job timeout
   const sk = rows.filter((r) => r.skipped).length;
   log(`commit ${ci + 1}/${commits.length} ${sha.slice(0, 7)}: ${files.length} files, ${sk} skipped, false_skips=${rows.filter((r) => r.falseSkip).length}, sing ${(sing.wallMs / 1000).toFixed(1)}s vs plain ${(orc.wallMs / 1000).toFixed(1)}s`);
 }
@@ -161,8 +178,10 @@ for (const [slot, sha] of picks.entries()) {
   const base = oracleBy.get(sha);
   await singPass(files); // warm: the cache holds a pass for exactly this tree
   cleanUntracked();
-  const imp = importers(sha, files);
-  const cands = [...imp.entries()].filter(([, s]) => s.size <= files.length / 2).sort((a, b) => b[1].size - a[1].size || (a[0] < b[0] ? -1 : 1));
+  // JS subjects: a statically imported module. Subjects with a `fault` rule (RTL): any tracked file matching its glob, in name order.
+  const cands = S.fault
+    ? treeMatch(sha, S.fault.glob).map((f) => [f, null])
+    : [...importers(sha, files).entries()].filter(([, s]) => s.size <= files.length / 2).sort((a, b) => b[1].size - a[1].size || (a[0] < b[0] ? -1 : 1));
   const start = [0, Math.floor(cands.length / 2), cands.length - 1][slot % 3]; // slot 0: most imported, 1: median, 2: least imported
   const order = cands.length ? [...cands.slice(start), ...cands.slice(0, start)] : [];
   const tried = new Set();
@@ -174,23 +193,24 @@ for (const [slot, sha] of picks.entries()) {
     const orig = readFileSync(abs, 'utf8');
     const lines = orig.split('\n');
     const k = lines[0].startsWith('#!') ? 1 : 0;
-    lines.splice(k, 0, "throw new Error('bench');");
+    lines.splice(k, 0, S.fault ? S.fault.line : "throw new Error('bench');");
     writeFileSync(abs, lines.join('\n'));
     const sing = await singPass(files);
     cleanUntracked();
     const orc = await oraclePass(files);
     git('checkout', '-q', '--', src);
     cleanUntracked();
-    const clean = git('status', '--porcelain').trim();
+    const clean = git('status', '--porcelain').split('\n').filter((l) => l && !(S.testonceConfig && l === '?? testonce.json')).join('\n'); // the variant's own config is not a leftover
     const sm = new Map(sing.results.map((r) => [r.file, r]));
     const newlyFailing = orc.results.filter((o) => o.code !== 0 && base.get(o.file)?.code === 0);
     const detected = newlyFailing.filter((o) => { const s = sm.get(o.file); return !s.skipped && s.code !== 0; });
     const missed = newlyFailing.filter((o) => { const s = sm.get(o.file); return s.skipped || s.code === 0; }).map((o) => ({ file: o.file, skipped: sm.get(o.file).skipped, singCode: sm.get(o.file).code }));
-    rec.attempts.push({ source: src, directImporters: imps.size, effective: newlyFailing.length > 0, newlyFailing: newlyFailing.length, detected: detected.length, missed, revertedClean: clean === '' });
+    rec.attempts.push({ source: src, directImporters: imps ? imps.size : null, effective: newlyFailing.length > 0, newlyFailing: newlyFailing.length, detected: detected.length, missed, revertedClean: clean === '' });
     log(`fault ${sha.slice(0, 7)} ${src}: oracle newly failing=${newlyFailing.length}, testonce detected=${detected.length}, missed=${missed.length}${clean ? ' REVERT DIRTY' : ''}`);
     if (newlyFailing.length > 0) break;
   }
   faultRecs.push(rec);
+  writeFileSync(path.join(OUT, `${NAME}.partial.json`), JSON.stringify({ partial: true, commits: perCommit, faults: faultRecs }, null, 1));
 }
 
 // ---- summary ----
@@ -222,6 +242,6 @@ const summary = {
   total_runtime_s: +((Date.now() - t0) / 1000).toFixed(0),
   testonce_git_head: execFileSync('git', ['rev-parse', 'HEAD'], { cwd: path.resolve(HERE, '..'), encoding: 'utf8' }).trim(),
 };
-writeFileSync(path.join(OUT, `${subject}.json`), JSON.stringify({ summary, faults: faultRecs, commits: perCommit }, null, 1));
+writeFileSync(path.join(OUT, `${NAME}.json`), JSON.stringify({ summary, faults: faultRecs, commits: perCommit }, null, 1));
 console.log(JSON.stringify(summary, null, 1));
 process.exit(summary.false_skips > 0 ? 1 : 0);

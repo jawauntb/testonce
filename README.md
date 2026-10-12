@@ -36,6 +36,7 @@ testonce: 37 files: 21 skipped, 16 ran, 0 failed
 | Records every file a test reads, lists, probes or executes, across child processes | Implemented, tested (`test/cli.test.mjs`) |
 | Skips only when every recorded input is byte-identical (SHA-256), with the same command and env | Implemented, tested |
 | A file the test reads and then rewrites makes it uncacheable, never wrongly cached | Implemented, tested |
+| Each test gets its own empty temp directory (`TMPDIR`, `TMP`, `TEMP`), removed when the test ends, so temp files never make a test rerun and never pile up. No temp-dir naming rule or sweeper script is needed | Implemented, tested (`test/cli.test.mjs`, `test/tmp.test.mjs`). A testonce killed with SIGKILL leaves its directory behind; a later run deletes it after 24 h. On by default; `"privateTmp": false` turns it off |
 | Tests that reach the network or run `git`, `curl`, `docker`, `ssh`… always run | Implemented, tested |
 | Every 10th would-be skip runs anyway; a failure on unchanged inputs quarantines the test | Implemented, tested |
 | `affected` (lists the tests an edit might affect) never misses a test whose recorded inputs include a changed path | **Verified** for the bloom model (`formal/Testonce/Bloom.lean`, SafeVerify receipt in `docs/lea/`); index range checked by tests |
@@ -71,12 +72,38 @@ these is false for that test (`audit_mismatch`). The test is then quarantined: i
 `testonce clear` it.
 
 What is traced: every path a test reads, lists, checks for or executes, across child processes,
-except `/proc`, `/sys`, `/dev`, `/run`, the cache directory and your `ignore` globs. A path the test
-checked and found missing is recorded as missing, even if the test then creates it. The temp
-directory is traced like everything else; files a test creates there are its own outputs.
+except `/proc`, `/sys`, `/dev`, `/run`, the cache directory, your `ignore` globs and the test's private
+temp directory (below). A path the test checked and found missing is recorded as missing, even if the
+test then creates it. A regular file the test only checks with `stat` is recorded by its content, like a
+read, because tools act on its size and mtime in place of its bytes: Python loads a module's `.pyc` after
+only a `stat` of its `.py`, so an edited `.py` must rerun the test. A path reached through a symlink the test created is recorded at the symlink's
+target. A test that renames or hard-links a file it did not create is not cached. A write through a
+symlink that was already there (`truncate`, or deleting a file inside a linked directory) counts as a
+write to the file the link points at, so a test that reads a file and then changes it that way is not
+cached. When a test reads a symlink itself (`readlink`, or `lstat` finding a link), where the link points
+is recorded, so repointing it reruns the test even if the new target has the same type and bytes. A test
+that talks to an abstract unix socket (`@name`, which has no file to hash) counts as using the network
+and is not cached. So does one that sends to an outside address with `sendmmsg`, and every address in
+the call is checked, not just the first.
+
+**Temp files.** Each test runs with `TMPDIR`, `TMP` and `TEMP` set to a new, empty directory that
+testonce creates for that run (`<temp dir>/testonce-XXXXXX/tmp`) and deletes when the test ends: pass,
+fail, timeout or Ctrl-C. Because the directory starts empty every time, anything the test finds there it
+made itself (its starting content is the same on every run, so assumption 1 still holds), and nothing in
+it is an input: listing it, leaving files in it or writing a file there after
+reading it never makes a test rerun or uncacheable. The rest of the real temp directory is still traced:
+a fixture another process put in `/tmp` and the test reads by path is an input, as before. The three
+variables are hashed as the fixed value `<testonce-private-tmp>`. If testonce is killed with SIGKILL, the
+directory stays; each later `run` or `each` deletes `testonce-*` directories that hold testonce's marker
+file and are more than 24 hours old (checked at most once an hour), and nothing else. One behaviour changes: a test that reads files a
+*different* process wrote into `$TMPDIR` beforehand (a global setup step, say) no longer finds them there.
+That test fails or reruns; it is never wrongly skipped. Set `"privateTmp": false` in `testonce.json`, or
+`TESTONCE_PRIVATE_TMP=0`, to use the shared temp directory as before (then the temp directory is traced
+like everything else; files a test creates there are its own outputs).
 
 Environment variables: strace cannot see `getenv`, so every variable counts except per-run CI
-bookkeeping. Excluded by prefix: `GITHUB_`, `RUNNER_`, `ACTIONS_`, `BUILDKITE_`, `GITLAB_`, `CI_`,
+bookkeeping. With the private temp directory on, `TMPDIR`, `TMP` and `TEMP` always count, as the fixed
+placeholder above, whatever `env` says. Excluded by prefix: `GITHUB_`, `RUNNER_`, `ACTIONS_`, `BUILDKITE_`, `GITLAB_`, `CI_`,
 `CIRCLE_`, `BLACKSMITH_`, `TESTONCE_`, `TRAVIS_`, `JENKINS_`, `DRONE_`. Excluded by name:
 `_`, `PWD`, `OLDPWD`, `SHLVL`, `HOSTNAME`, `TERM_SESSION_ID`, `INVOCATION_ID`, `JOURNAL_STREAM`,
 `SSH_*` session variables, `WINDOWID`, `COLUMNS`, `LINES`, `BUILD_ID`, `BUILD_NUMBER`, `BUILD_URL`,
@@ -253,6 +280,7 @@ runners, coding-agent sandboxes) and miss where toolchains differ.
   "denyExec": ["git", "curl", "docker"],
   "env": { "exclude": ["MY_BUILD_NUMBER"] },
   "noCache": ["tests/timing-*.test.mjs"],
+  "privateTmp": true,
   "trustStat": true
 }
 ```

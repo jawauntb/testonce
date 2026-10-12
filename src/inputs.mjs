@@ -1,6 +1,6 @@
 // From traced access events to a manifest of inputs, and back: re-hash a manifest against today's disk.
 import { createHash } from 'node:crypto';
-import { openSync, readSync, closeSync, statSync, readdirSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { openSync, readSync, closeSync, statSync, readdirSync, readlinkSync, realpathSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 export const DEFAULT_DENY_EXEC = ['git', 'curl', 'wget', 'ssh', 'scp', 'rsync', 'docker', 'podman', 'kubectl', 'gh', 'aws', 'gcloud', 'az', 'nc', 'ping'];
@@ -29,34 +29,106 @@ const STRENGTH = { stat: 1, absent: 1, list: 2, read: 3, exec: 3 };
 // Reduce ordered events to {inputs: Map<abs, kind>, outputs: Set<abs>, uncacheable: string[]}.
 // A path whose first contact is a write is an output: later reads see the run's own bytes.
 // A path whose content was read and later written is a mutated input: the bytes it saw are gone.
-export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY_EXEC }) {
-  const skip = makeIgnore({ root, cacheDir, ignore });
+// `privateDirs`: the run's private temp dir (src/tmp.mjs). It was created empty for this run alone, so anything
+// in it the run made itself, and none of it is an input. A path that reaches outside it through a symlink the
+// run created is followed (see `follow`), so that escape is still recorded.
+export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY_EXEC, privateDirs = [] }) {
+  const ignored = makeIgnore({ root, cacheDir, ignore });
+  const inPrivate = (abs) => privateDirs.some((p) => abs === p || abs.startsWith(p + '/'));
+  const dropped = (abs) => inPrivate(abs) || ignored(abs, keyOf(root, abs));
   const inputs = new Map();
   const seenType = new Map(); // abs -> type observed at the first stat, before the run changed it
   const outputs = new Set();
   const mutated = new Set();
+  const linksSeen = new Set(); // symlinks the run looked at as links (readlink, lstat)
+  const links = new Map(); // symlinks this run created: where (parent resolved) -> target as written
   const reasons = [];
   const deny = new Set(denyExec);
+  const observe = (kind, abs, type) => {
+    if (kind === 'exec' && deny.has(path.basename(abs))) reasons.push(`runs outside tool: ${path.basename(abs)}`);
+    if (dropped(abs) || outputs.has(abs)) return;
+    const prev = inputs.get(abs);
+    if (kind === 'stat' && type && !seenType.has(abs)) seenType.set(abs, type);
+    if (!prev || STRENGTH[kind] > STRENGTH[prev]) inputs.set(abs, kind === 'exec' ? 'read' : kind);
+  };
+  const write = (abs) => {
+    if (dropped(abs) || outputs.has(abs)) return;
+    const prev = inputs.get(abs);
+    if (prev === 'read' || prev === 'exec' || prev === 'list' || linksSeen.has(abs)) mutated.add(abs);
+    // Checked, then created: the run depended on the path being absent (or on its type), so that
+    // observation stays an input. A leftover output makes the next run rerun, never wrongly skip.
+    outputs.add(abs);
+  };
+  // Where a path really lands, through the run's own symlinks. Used only to add inputs or flag a mutation,
+  // never to add an output, so a stale or wrong answer can cost a rerun but never cause a skip.
+  const real = (p) => {
+    const r = follow(p, links);
+    if (r === null) reasons.push('a symlink the run created has a target testonce cannot read');
+    return r;
+  };
+  const touchedVia = (abs, r) => { if (r && r !== abs && !dropped(r) && !outputs.has(r) && (['read', 'exec', 'list'].includes(inputs.get(r)) || linksSeen.has(r))) mutated.add(r); };
+  // The same, for a call that acts on the last component itself (rename, link, unlink, symlink creation).
+  const locate = (abs) => { const d = real(path.dirname(abs)); return d === null ? abs : path.join(d, path.basename(abs)); };
+  // A write lands where the kernel resolves the path, through links older than the run too (resolved after it:
+  // the path, else its parent). Only flags a mutation, so a stale answer costs a rerun, never a skip.
+  const onDisk = (p) => { for (const q of [p, path.dirname(p)]) try { return path.join(realpathSync.native(q), p.slice(q.length)); } catch {} return null; };
+  const wrote = (abs) => { write(abs); const l = locate(abs); touchedVia(abs, l); touchedVia(abs, onDisk(l)); };
   for (const e of events) {
-    if (e.kind === 'net') { reasons.push(`network: ${e.path}`); continue; }
     const abs = e.path;
-    if (e.kind === 'exec' && deny.has(path.basename(abs))) reasons.push(`runs outside tool: ${path.basename(abs)}`);
-    if (skip(abs, keyOf(root, abs))) continue;
-    if (outputs.has(abs)) continue;
-    if (e.kind === 'write') {
-      const prev = inputs.get(abs);
-      if (prev === 'read' || prev === 'exec' || prev === 'list') mutated.add(abs);
-      // Checked, then created: the run depended on the path being absent (or on its type), so that
-      // observation stays an input. A leftover output makes the next run rerun, never wrongly skip.
-      outputs.add(abs);
+    if (e.kind === 'net') {
+      // A unix socket in the private temp dir belongs to a process this run started.
+      if (!(abs.startsWith('unix:') && inPrivate(real(abs.slice(5)) ?? ''))) reasons.push(`network: ${abs}`);
       continue;
     }
-    const prev = inputs.get(abs);
-    if (e.kind === 'stat' && e.type && !seenType.has(abs)) seenType.set(abs, e.type);
-    if (!prev || STRENGTH[e.kind] > STRENGTH[prev]) inputs.set(abs, e.kind === 'exec' ? 'read' : e.kind);
+    if (e.kind === 'symlink') {
+      wrote(abs);
+      links.set(locate(abs), e.target ?? null);
+      continue;
+    }
+    if (e.kind === 'move') {
+      // The bytes at `from` move to `to`. Moving a file the run did not create mutates an input.
+      for (const f of new Set([abs, locate(abs)])) if (!dropped(f) && !outputs.has(f)) { observe('read', f); mutated.add(f); }
+      wrote(e.to);
+      const from = locate(abs), to = locate(e.to);
+      for (const [l, t] of [...links]) if (l === from || l.startsWith(from + '/')) links.set(to + l.slice(from.length), t);
+      continue;
+    }
+    if (e.kind === 'hardlink') {
+      // A second name for a file the run did not create: writes through it would change that file unseen.
+      for (const f of new Set([e.from, locate(e.from)])) if (!dropped(f) && !outputs.has(f)) reasons.push(`hard link to a file the run did not create: ${keyOf(root, f)}`);
+      write(abs);
+      continue;
+    }
+    if (e.kind === 'write') { wrote(abs); continue; }
+    if (e.kind === 'link') { for (const q of new Set([abs, locate(e.via ?? abs)])) if (!dropped(q) && !outputs.has(q)) linksSeen.add(q); continue; }
+    const r = real(e.via ?? abs);
+    observe(e.kind, abs, e.type);
+    if (r && r !== abs) observe(e.kind, r, e.type);
   }
   for (const m of mutated) reasons.push(`input modified by the run: ${keyOf(root, m)} (add it to "ignore" if it is a cache)`);
-  return { inputs, outputs, seenType, uncacheable: [...new Set(reasons)] };
+  return { inputs, linksSeen, outputs, seenType, uncacheable: [...new Set(reasons)] };
+}
+
+// Resolve `p` through the symlinks the run itself created, component by component as the kernel does, so a
+// `..` after such a link climbs from its target. null: a link whose target strace did not show.
+// Links that existed before the run need no help: their paths are fingerprinted through them at check time.
+export function follow(p, links, depth = 0) {
+  if (!links.size) return path.resolve(p);
+  const parts = p.split('/');
+  let cur = '';
+  for (let i = 0; i < parts.length; i++) {
+    const c = parts[i];
+    if (c === '' || c === '.') continue;
+    if (c === '..') { cur = path.dirname(cur || '/'); if (cur === '/') cur = ''; continue; }
+    cur += '/' + c;
+    if (!links.has(cur)) continue;
+    const t = links.get(cur);
+    if (t == null || depth > 40) return null;
+    const rest = parts.slice(i + 1).join('/');
+    const base = t[0] === '/' ? t : `${path.dirname(cur)}/${t}`;
+    return follow(rest ? `${base}/${rest}` : base, links, depth + 1);
+  }
+  return cur || '/';
 }
 
 // ---- fingerprints of one input ----
@@ -108,8 +180,10 @@ function typeOf(abs) {
   } catch { return 'absent'; }
 }
 
-// kind: read -> content hash; list -> sorted entry names minus the run's own outputs; stat/absent -> type.
+// kind: read -> content hash; list -> sorted entry names minus the run's own outputs; link -> link target;
+// stat/absent -> type.
 export function fingerprint(abs, kind, excluded = []) {
+  if (kind === 'link') { try { return 'link:' + readlinkSync(abs); } catch (e) { return e.code === 'EINVAL' ? 'notlink' : 'absent'; } }
   const t = typeOf(abs);
   if (t === 'absent') return 'absent';
   if (kind === 'read' && t === 'file') {
@@ -148,13 +222,17 @@ export function snapshot(reduced, root) {
     const excluded = kind === 'list' ? (outputsByDir.get(abs) ?? []).sort() : undefined;
     // absent and stat record what the trace observed during the run, not the disk afterwards:
     // a run that deletes or creates a path it checked must not rewrite what it saw.
-    const fp = kind === 'absent' ? 'absent'
-      : kind === 'stat' && reduced.seenType?.has(abs) ? reduced.seenType.get(abs)
-      : fingerprint(abs, kind, excluded);
-    const row = [keyOf(root, abs), kind, fp];
+    // A stat'ed file the run never wrote counts by content: tools act on its size and mtime (a .pyc vs its .py).
+    const k = kind === 'stat' && reduced.seenType?.get(abs) === 'file' && !reduced.outputs?.has(abs) ? 'read' : kind;
+    const fp = k === 'absent' ? 'absent'
+      : k === 'stat' && reduced.seenType?.has(abs) ? reduced.seenType.get(abs)
+      : fingerprint(abs, k, excluded);
+    const row = [keyOf(root, abs), k, fp];
     if (excluded && excluded.length) row.push(excluded);
     out.push(row);
   }
+  // Beside the path's other row: the target as written, so a repointed link is a change.
+  for (const abs of [...(reduced.linksSeen ?? [])].sort()) out.push([keyOf(root, abs), 'link', fingerprint(abs, 'link')]);
   return out;
 }
 

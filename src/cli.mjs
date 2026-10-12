@@ -3,12 +3,15 @@ import { createHash } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import * as bloom from './bloom.mjs';
+import { bloomKey, queryKeys } from './bloom.mjs';
+export { bloomKey, queryKeys };
 import { traced, traceStatus } from './trace.mjs';
 import { doctor, noTraceMessage } from './doctor.mjs';
 import { splitLinuxFlag, wantsLinux, inContainer, runInLinux, realIo } from './linux.mjs';
 import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore } from './inputs.mjs';
 import { unlock } from './unlock.mjs';
-import { envFingerprint, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
+import { makePrivateTmp, removeTree, sweepSometimes } from './tmp.mjs';
+import { envFingerprint, PRIVATE_TMP_PLACEHOLDER, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
 
 const say = (msg) => process.stderr.write(`testonce: ${msg}\n`);
 
@@ -39,12 +42,16 @@ function noTraceNotice(tr) {
   say(noTraceMessage(tr));
 }
 
-function passthrough(argv, cwd) {
+function passthrough(argv, cwd, env = process.env) {
   return new Promise((resolve) => {
-    const c = spawn(argv[0], argv.slice(1), { cwd, stdio: 'inherit' });
+    const c = spawn(argv[0], argv.slice(1), { cwd, env, stdio: 'inherit' });
     c.on('exit', (code, sig) => resolve(sig ? 129 : code ?? 1));
     c.on('error', () => resolve(127));
   });
+}
+
+function privateTmpOrNull() {
+  try { return makePrivateTmp(); } catch (e) { say(`cannot create a private temp dir (${e.message}); this run uses the shared one`); return null; }
 }
 
 // Which stored entry, if any, still matches the disk exactly?
@@ -56,9 +63,10 @@ function hit(rec, key, root) {
   return null;
 }
 
-function whyMiss(rec, key, root, envNow) {
+function whyMiss(rec, key, root, envNow, privateTmp) {
   const same = rec.entries.filter((e) => e.key === key);
   if (!rec.entries.length) return 'no passing run recorded';
+  if (!same.length && !!rec.entries[0].privateTmp !== privateTmp) return `privateTmp turned ${privateTmp ? 'on' : 'off'} since the last pass (TMPDIR, TMP, TEMP)`;
   if (!same.length) {
     const was = new Set(rec.entries[0].envNames ?? []);
     const now = new Set(envNow ?? []);
@@ -84,8 +92,9 @@ export async function run(args) {
   const root = findRoot(cwd);
   const cfg = loadConfig(root);
   name ??= argv.join(' ');
-  const env = envFingerprint(process.env, cfg.env);
-  const key = createHash('sha256').update(JSON.stringify({ argv, cwd: keyOf(root, cwd), env: env.hash, platform: process.platform, arch: process.arch })).digest('hex');
+  const env = envFingerprint(process.env, cfg.env, { privateTmp: cfg.privateTmp });
+  // inputs: 3 = stat'ed files count by content, link targets are inputs; older records never match.
+  const key = createHash('sha256').update(JSON.stringify({ argv, cwd: keyOf(root, cwd), env: env.hash, platform: process.platform, arch: process.arch, inputs: 3 })).digest('hex');
 
   const tr = traceStatus();
   if (!tr.ok) {
@@ -93,9 +102,11 @@ export async function run(args) {
     return passthrough(argv, cwd);
   }
 
+  if (!process.env.TESTONCE_NO_SWEEP) sweepSometimes(cfg.cacheDir);
   if (cfg.noCache.some((g) => g === name || globRe(g).test(name))) {
     say(`run ${name}: listed in noCache, always runs`);
-    return passthrough(argv, cwd);
+    const t = cfg.privateTmp ? privateTmpOrNull() : null;
+    try { return await passthrough(argv, cwd, t ? { ...process.env, ...t.env } : process.env); } finally { if (t) removeTree(t.base); }
   }
   const rec = load(cfg.cacheDir, name);
   let audit = false;
@@ -115,11 +126,19 @@ export async function run(args) {
         return 0;
       }
       say(`audit ${name}: inputs unchanged, running anyway (${stale ? `no real run in ${cfg.auditMaxAgeHours} h` : `every ${cfg.auditEvery}th skip is checked`})`);
-    } else if (rec.entries.length) say(`run ${name}: ${whyMiss(rec, key, root, env.names)}`);
+    } else if (rec.entries.length) say(`run ${name}: ${whyMiss(rec, key, root, env.names, cfg.privateTmp)}`);
   }
 
   const started = Date.now();
-  const { code, accesses } = await traced(argv, { cwd });
+  // The test's own empty TMPDIR, removed when it ends however it ends (a SIGKILLed testonce leaves it to `sweep`).
+  const tmp = cfg.privateTmp ? privateTmpOrNull() : null;
+  let code, accesses, signal;
+  try {
+    ({ code, accesses, signal } = await traced(argv, { cwd, env: tmp ? { ...process.env, ...tmp.env } : process.env }));
+  } finally {
+    if (tmp && !removeTree(tmp.base)) say(`could not remove the private temp dir ${tmp.base}`);
+  }
+  if (signal) { say(`run ${name}: stopped by ${signal}, nothing recorded`); return code; }
   // Run history (newest last, 30 kept): what the add-ons (flaky, shard, order, report) read.
   rec.history = [...(rec.history ?? []), { at: new Date().toISOString(), ok: code === 0, ms: Date.now() - started, audit }].slice(-30);
   if (code !== 0) {
@@ -131,7 +150,10 @@ export async function run(args) {
     save(cfg.cacheDir, rec);
     return code;
   }
-  const reduced = reduce(accesses, { root, cacheDir: cfg.cacheDir, ignore: cfg.ignore, denyExec: cfg.denyExec });
+  const reduced = reduce(accesses, { root, cacheDir: cfg.cacheDir, ignore: cfg.ignore, denyExec: cfg.denyExec, privateDirs: tmp?.prefixes });
+  // The pass must hold under the configuration the key claims: with privateTmp on, a run that fell back to the
+  // shared temp dir is not recorded.
+  if (cfg.privateTmp && !tmp) reduced.uncacheable.unshift('could not create a private temp dir, so this run used the shared one');
   if (reduced.uncacheable.length) {
     rec.uncacheable = reduced.uncacheable.slice(0, 20);
     save(cfg.cacheDir, rec);
@@ -139,7 +161,7 @@ export async function run(args) {
     return 0;
   }
   const inputs = snapshot(reduced, root);
-  const entry = { key, argv, cwd: keyOf(root, cwd), envNames: env.names, passedAt: new Date().toISOString(), ms: Date.now() - started, inputs, bloom: bloom.encode(bloom.create(inputs.map(bloomKey))) };
+  const entry = { key, argv, cwd: keyOf(root, cwd), envNames: env.names, ...(cfg.privateTmp ? { privateTmp: true } : {}), passedAt: new Date().toISOString(), ms: Date.now() - started, inputs, bloom: bloom.encode(bloom.create(inputs.map(bloomKey))) };
   delete rec.uncacheable;
   rec.entries = [entry, ...rec.entries.filter((e) => !(e.key === key && JSON.stringify(e.inputs) === JSON.stringify(inputs)))].slice(0, MAX_ENTRIES);
   save(cfg.cacheDir, rec);
@@ -157,23 +179,6 @@ function changedPaths(base, root) {
     for (const part of p.split(' -> ')) out.add(part.replace(/^"|"$/g, ''));
   }
   return [...out];
-}
-
-// Directory listings are stored under their own key: a changed file can only change
-// the listing of a directory that contains it, never a plain stat of that directory.
-export const bloomKey = ([key, kind]) => (kind === 'list' ? `list:${key}` : key);
-
-// The bloom keys a changed path could hit: the path itself, and the listing of every ancestor.
-export function queryKeys(keys) {
-  const s = new Set();
-  for (const k of keys) {
-    s.add(k);
-    for (let d = path.dirname(k); ; d = path.dirname(d)) {
-      s.add(`list:${d}`);
-      if (d === '.' || d === '/') break;
-    }
-  }
-  return [...s];
 }
 
 export function affected(args) {
@@ -219,6 +224,7 @@ export function explain([name]) {
   const c = firstChanged(e.inputs, root);
   console.log(`${name}\n  passed ${ago(e.passedAt)} in ${e.ms} ms, ${e.inputs.length} inputs, ${e.envNames.length} env vars`);
   console.log(c ? `  would RUN: ${c.key} was ${c.was}, now ${c.now}` : '  would SKIP: every input is byte-identical');
+  if (e.privateTmp) console.log(`  temp dir: private to each run, removed after it; TMPDIR, TMP, TEMP hashed as ${PRIVATE_TMP_PLACEHOLDER}`);
   const kinds = {};
   for (const [, k] of e.inputs) kinds[k] = (kinds[k] ?? 0) + 1;
   console.log(`  by kind: ${Object.entries(kinds).map(([k, n]) => `${n} ${k}`).join(', ')}`);
@@ -257,7 +263,8 @@ export async function each(args) {
   const self = process.argv[1];
   const tr = traceStatus();
   if (!tr.ok) noTraceNotice(tr);
-  const childEnv = tr.ok ? process.env : { ...process.env, TESTONCE_QUIET_NOTRACE: '1' };
+  if (tr.ok) sweepSometimes(loadConfig(findRoot(process.cwd())).cacheDir);
+  const childEnv = { ...process.env, TESTONCE_NO_SWEEP: '1', ...(tr.ok ? {} : { TESTONCE_QUIET_NOTRACE: '1' }) };
   const tally = { skip: 0, ran: 0, failed: [] };
   const queue = [...files];
   const worker = async () => {
