@@ -611,6 +611,35 @@ dial();\n`;
 });
 
 // ---- a write that keeps a file's old bytes, and calls that succeed only on what was there ----
+test('a log appended inside a directory the test makes is not an input: the test is cached and skips (SymbiYosys work dirs)', { skip }, () => {
+  const r = repo({
+    'in.txt': 'ok',
+    'w.mjs': "import { mkdirSync, rmSync, appendFileSync, readFileSync } from 'node:fs'; rmSync('work', { recursive: true, force: true }); mkdirSync('work'); appendFileSync('work/logfile.txt', 'step 1\\n'); appendFileSync('work/logfile.txt', 'step 2\\n'); process.exit(readFileSync('in.txt', 'utf8') === 'ok' ? 0 : 1);\n",
+  });
+  try {
+    const first = r.sh('run', '--name', 'w', '--', 'node', 'w.mjs');
+    assert.match(first.err, /cached w/, first.err);
+    // A fresh checkout, as in CI: the work dir is gone. (A leftover output reruns the test by design.)
+    rmSync(path.join(r.dir, 'work'), { recursive: true, force: true });
+    assert.match(r.sh('run', '--name', 'w', '--', 'node', 'w.mjs').err, /skip w/);
+    rmSync(path.join(r.dir, 'work'), { recursive: true, force: true });
+    r.write('in.txt', 'changed');
+    assert.equal(r.sh('run', '--name', 'w', '--', 'node', 'w.mjs').code, 1, 'its real input changed: it reruns and fails');
+  } finally { r.done(); }
+});
+
+test('soundness: a symlink in a directory the test makes still exposes the file it points at to an append', { skip }, () => {
+  const r = repo({
+    'outside.txt': 'old',
+    'l.mjs': "import { mkdirSync, rmSync, symlinkSync, appendFileSync, statSync } from 'node:fs'; rmSync('d', { recursive: true, force: true }); mkdirSync('d'); symlinkSync('../outside.txt', 'd/l'); const before = statSync('outside.txt').size; appendFileSync('d/l', 'x'); process.exit(before === 3 ? 0 : 1);\n",
+  });
+  try {
+    const first = r.sh('run', '--name', 'l', '--', 'node', 'l.mjs');
+    assert.equal(first.code, 0, first.err);
+    assert.match(first.err, /not caching l/, 'appending to a file the run did not create, through a link it did, modifies an input');
+  } finally { r.done(); }
+});
+
 test('soundness: a write that keeps the bytes a file held before the run (append, a+, truncate to a length) makes them an input', { skip }, () => {
   const r = repo({
     'data.txt': 'ok',

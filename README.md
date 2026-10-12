@@ -90,7 +90,8 @@ network unless the test itself bound that address and port, with the same socket
 (or was refused while its own server was starting), so a dev server, a CI service container or a daemon on
 localhost makes the test uncacheable. A file the test opens for writing without truncating it (an append,
 `a+`, a SQLite database, `truncate` to a length) keeps its old bytes, so they count as read and the test is
-not cached, unless the test first found the path missing. Creating a directory, a link or an `O_EXCL` file
+not cached, unless the test first found the path missing or the file is inside a directory the test created
+(a SymbiYosys work directory's log, say: nothing there predates the run). Creating a directory, a link or an `O_EXCL` file
 records the path as missing beforehand (a dangling symlink there does not count as missing), and deleting a
 file or directory records it as present beforehand. Changing a file's mode or timestamps (`chmod`, `utimes`)
 leaves it an input instead of making it an output. An append to one of GitHub Actions' runner command files, the
