@@ -78,7 +78,7 @@ Three public hardware projects, each with a different kind of test, replayed by 
 
 A fault here is a compile error in one RTL file, so a run that detects it shows that testonce saw the file as an
 input of every test that compiles it. `verilog-axis` and `wb2axip` keep the first 24 and 20 test files in name
-order that pass at the newest replayed commit within 300 s and 240 s; `openc910` runs four cases (`hello_world`, `ISA_IMAC`, `ISA_AMO`, `csr`), one job each; `ISA_FP` is left out because its program uses half-precision instructions that the public prebuilt XuanTie assembler rejects.
+order that pass at the newest replayed commit within 300 s and 240 s (the time limit keeps more files on a faster runner, so `--selection <selection-*.json>` pins the list an earlier run chose); `openc910` runs four cases (`hello_world`, `ISA_IMAC`, `ISA_AMO`, `csr`), one job each; `ISA_FP` is left out because its program uses half-precision instructions that the public prebuilt XuanTie assembler rejects.
 
 Each job writes `out/<subject>.json` (every row), `out/versions-*.txt` and `out/receipt-*.json`
 (`bench/rtl/receipt.mjs`): the commits, the headline numbers, the sha256 of the results, of the harness and of

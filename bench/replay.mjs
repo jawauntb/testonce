@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Outside-checked soundness benchmark for testonce. See bench/README.md.
-//   node bench/replay.mjs <subject> [--commits N] [--budget-min M] [--jobs J] [--faults K] [--out DIR] [--tests a,b] [--tag T]
+//   node bench/replay.mjs <subject> [--commits N] [--budget-min M] [--jobs J] [--faults K] [--out DIR] [--tests a,b] [--tag T] [--selection selection.json]
 // The oracle is the repo's own test command run plainly. testonce is never consulted for ground truth.
 import { spawn, execFileSync } from 'node:child_process';
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync, symlinkSync, readdirSync } from 'node:fs';
@@ -109,7 +109,14 @@ log(`${commits.length} commits ${commits[0].slice(0, 7)}..${commits.at(-1).slice
 
 // ---- selection (held-out subject without deps: keep files whose oracle passes at the newest commit) ----
 let selection = null;
-if (S.select) {
+// --selection FILE pins the test list (a selection-*.json from an earlier run), so runs on different runners
+// replay the same files: the time-limit rule keeps more files on a faster machine.
+const PIN = opt('selection', null);
+if (PIN) {
+  selection = JSON.parse(readFileSync(PIN, 'utf8')).files;
+  log(`selected ${selection.length} files pinned by ${PIN}`);
+  writeFileSync(path.join(OUT, `selection-${NAME}.json`), JSON.stringify({ subject, newest: commits.at(-1), rule: `pinned by ${path.basename(PIN)}`, files: selection }, null, 1));
+} else if (S.select) {
   checkout(commits.at(-1));
   const all = filesAt(commits.at(-1));
   selection = [];
