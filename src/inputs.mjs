@@ -78,6 +78,7 @@ export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY
   // the path, else its parent). Only flags a mutation, so a stale answer costs a rerun, never a skip.
   const onDisk = (p) => { for (const q of [p, path.dirname(p)]) try { return path.join(realpathSync.native(q), p.slice(q.length)); } catch {} return null; };
   const wrote = (abs) => { write(abs); const l = locate(abs); touchedVia(abs, l); touchedVia(abs, onDisk(l)); };
+  const madeHere = (p) => { for (let d = path.dirname(p); d !== path.dirname(d); d = path.dirname(d)) if (inputs.get(d) === 'absent' && outputs.has(d)) return true; return false; };
   for (const e of events) {
     const abs = e.path;
     if (sink.has(abs) && e.kind !== 'write') {
@@ -112,6 +113,9 @@ export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY
     if (e.kind === 'link') { for (const q of new Set([abs, locate(e.via ?? abs)])) if (!dropped(q) && !outputs.has(q)) linksSeen.add(q); continue; }
     if (e.kept && inputs.get(abs) === 'absent') continue; // seen absent first: there were no old bytes to keep
     const r = real(e.via ?? abs);
+    // Below a directory the run made (seen absent, then created) nothing predates the run: no old bytes to keep.
+    // A symlink there can still point outside, so its target is observed as usual.
+    if (e.kept && madeHere(abs)) { if (r && r !== abs) observe(e.kind, r, e.type); continue; }
     observe(e.kind, abs, e.type);
     if (r && r !== abs) observe(e.kind, r, e.type);
   }
