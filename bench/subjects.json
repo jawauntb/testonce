@@ -3,7 +3,11 @@
     "split": "dev",
     "repo": "/home/user/admissible",
     "testGlob": "tests/*.test.mjs",
-    "cmd": ["node", "--test", "{}"],
+    "cmd": [
+      "node",
+      "--test",
+      "{}"
+    ],
     "nodeModules": true,
     "commits": 8,
     "select": null
@@ -12,9 +16,121 @@
     "split": "held-out",
     "repo": "/home/user/lattice-animal",
     "testGlob": "tests/*.test.mjs",
-    "cmd": ["node", "--test", "{}"],
+    "cmd": [
+      "node",
+      "--test",
+      "{}"
+    ],
     "nodeModules": false,
     "commits": 10,
-    "select": { "maxFiles": 40, "timeoutSec": 20 }
+    "select": {
+      "maxFiles": 40,
+      "timeoutSec": 20
+    }
+  },
+  "verilog-axis": {
+    "split": "held-out",
+    "url": "https://github.com/alexforencich/verilog-axis",
+    "testGlob": "tb/*/test_*.py",
+    "cmd": [
+      "python3",
+      "-m",
+      "pytest",
+      "-q",
+      "-p",
+      "no:cacheprovider",
+      "{}"
+    ],
+    "env": {
+      "PYTHONDONTWRITEBYTECODE": "1"
+    },
+    "nodeModules": false,
+    "commits": 6,
+    "timeoutSec": 900,
+    "select": {
+      "maxFiles": 24,
+      "timeoutSec": 300
+    },
+    "fault": {
+      "glob": "rtl/*.v",
+      "line": "testonce_bench_fault;",
+      "note": "Icarus treats an undefined macro as a warning, so a bare statement at file scope (a syntax error in every tool) is used here."
+    }
+  },
+  "wb2axip": {
+    "split": "held-out",
+    "url": "https://github.com/ZipCPU/wb2axip",
+    "testGlob": "bench/formal/*.sby",
+    "cmd": [
+      "bash",
+      "{bench}/rtl/sby.sh",
+      "{}"
+    ],
+    "nodeModules": false,
+    "commits": 8,
+    "timeoutSec": 900,
+    "select": {
+      "maxFiles": 20,
+      "timeoutSec": 240
+    },
+    "fault": {
+      "glob": "rtl/*.v",
+      "line": "`testonce_bench_fault"
+    }
+  },
+  "openc910": {
+    "split": "held-out",
+    "url": "https://github.com/XUANTIE-RV/openc910",
+    "tests": [
+      "hello_world",
+      "ISA_IMAC",
+      "ISA_AMO",
+      "csr"
+    ],
+    "cmd": [
+      "bash",
+      "{bench}/rtl/openc910-case.sh",
+      "{}"
+    ],
+    "env": {
+      "TOOL_EXTENSION": "$XUANTIE_BIN",
+      "C910_JOBS": "$C910_JOBS",
+      "C910_SIM": "verilator"
+    },
+    "nodeModules": false,
+    "commits": 5,
+    "timeoutSec": 5400,
+    "select": null,
+    "fault": {
+      "glob": "C910_RTL_FACTORY/gen_rtl/cpu/rtl/*.v",
+      "line": "`testonce_bench_fault"
+    }
+  },
+  "wb2axip-configured": {
+    "split": "held-out",
+    "url": "https://github.com/ZipCPU/wb2axip",
+    "testGlob": "bench/formal/*.sby",
+    "cmd": [
+      "bash",
+      "{bench}/rtl/sby.sh",
+      "{}"
+    ],
+    "nodeModules": false,
+    "commits": 8,
+    "timeoutSec": 900,
+    "select": {
+      "maxFiles": 20,
+      "timeoutSec": 240
+    },
+    "fault": {
+      "glob": "rtl/*.v",
+      "line": "`testonce_bench_fault"
+    },
+    "testonceConfig": {
+      "ignore": [
+        "**/.local/state/yosys/history"
+      ]
+    },
+    "note": "wb2axip with the one line testonce prints when it refuses to cache: yosys rewrites its own command history at $HOME/.local/state/yosys/history on every run."
   }
 }

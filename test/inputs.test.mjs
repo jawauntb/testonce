@@ -77,3 +77,108 @@ test('env fingerprint: default mode ignores CI noise; allowlist mode hashes only
   assert.equal(envFingerprint({ PATH: '/bin', FOO: 'x', SESSION: 'a' }, opts).hash, envFingerprint({ PATH: '/bin', FOO: 'x', SESSION: 'b' }, opts).hash);
   assert.notEqual(envFingerprint({ FOO: 'x' }, opts).hash, envFingerprint({ FOO: 'y' }, opts).hash);
 });
+
+// ---- the private temp dir (src/tmp.mjs) in reduce ----
+const P = '/tmp/testonce-abc';
+const priv = (events) => reduce(events, { ...opts, privateDirs: [P, '/tmp-alias/testonce-abc'] });
+
+test('privateTmp: nothing under the private dir is an input or an output, and writing after reading there is fine', () => {
+  const out = priv([
+    { kind: 'list', path: `${P}/tmp` }, { kind: 'absent', path: `${P}/tmp/x` }, { kind: 'stat', path: `${P}/tmp/d`, type: 'dir' },
+    { kind: 'read', path: `${P}/tmp/d/a` }, { kind: 'write', path: `${P}/tmp/d/a` }, { kind: 'exec', path: `${P}/tmp/bin/tool` },
+    { kind: 'read', path: '/tmp-alias/testonce-abc/tmp/y' }, { kind: 'move', path: `${P}/tmp/a.part`, to: `${P}/tmp/a` },
+    { kind: 'net', path: `unix:${P}/tmp/server.sock` },
+  ]);
+  assert.equal(out.inputs.size, 0);
+  assert.equal(out.outputs.size, 0);
+  assert.deepEqual(out.uncacheable, []);
+});
+
+test('soundness, privateTmp: the real temp dir outside the private dir is traced as before', () => {
+  const out = priv([{ kind: 'read', path: '/tmp/fixture.txt' }, { kind: 'list', path: '/tmp' }, { kind: 'read', path: '/tmp/testonce-abcd/x' }]);
+  assert.deepEqual([...out.inputs.keys()].sort(), ['/tmp', '/tmp/fixture.txt', '/tmp/testonce-abcd/x'], 'a sibling with a longer name is not the private dir');
+  assert.match(priv([{ kind: 'net', path: 'unix:/tmp/other.sock' }]).uncacheable[0], /network: unix:\/tmp\/other.sock/);
+});
+
+test('soundness, privateTmp: reads, probes and runs through a symlink the run made are recorded at the target', () => {
+  const out = priv([
+    { kind: 'symlink', path: `${P}/tmp/proj/nm`, target: '/work/repo/node_modules' },
+    { kind: 'symlink', path: `${P}/tmp/proj/rel`, target: '../../../../work/repo/lib' }, // relative to the link's directory
+    { kind: 'read', path: `${P}/tmp/proj/nm/pkg/index.js` },
+    { kind: 'absent', path: `${P}/tmp/proj/nm/missing` },
+    { kind: 'stat', path: `${P}/tmp/proj/rel/a.js`, type: 'file' },
+    { kind: 'exec', path: `${P}/tmp/proj/nm/.bin/tool` },
+    { kind: 'absent', path: `${P}/tmp/proj/marker`, via: `${P}/tmp/proj/nm/../marker` }, // `..` climbs from the target
+  ]);
+  assert.deepEqual(Object.fromEntries(out.inputs), {
+    '/work/repo/node_modules/pkg/index.js': 'read',
+    '/work/repo/node_modules/missing': 'absent',
+    '/work/repo/lib/a.js': 'stat',
+    '/work/repo/node_modules/.bin/tool': 'read',
+    '/work/repo/marker': 'absent',
+  });
+  assert.equal(out.seenType.get('/work/repo/lib/a.js'), 'file');
+});
+
+test('soundness: a write through a symlink the run made marks the target as mutated, never as an output', () => {
+  const out = priv([
+    { kind: 'symlink', path: `${P}/tmp/d`, target: '/work/repo/data' },
+    { kind: 'read', path: `${P}/tmp/d/x.json` },
+    { kind: 'write', path: `${P}/tmp/d/x.json` },
+    { kind: 'read', path: '/work/repo/data/y.json' },
+    { kind: 'write', path: `${P}/tmp/d/y.json` },
+  ]);
+  assert.match(out.uncacheable.join('\n'), /input modified by the run: data\/x.json/);
+  assert.match(out.uncacheable.join('\n'), /input modified by the run: data\/y.json/);
+  assert.ok(!out.outputs.has('/work/repo/data/x.json'));
+});
+
+test('soundness: moving a file the run did not create mutates an input; moving its own file is free', () => {
+  assert.match(r([{ kind: 'move', path: '/work/repo/fixture.txt', to: '/work/repo/moved.txt' }]).uncacheable[0], /input modified by the run: fixture.txt/);
+  const own = r([{ kind: 'write', path: '/work/repo/a.tmp' }, { kind: 'move', path: '/work/repo/a.tmp', to: '/work/repo/a' }, { kind: 'read', path: '/work/repo/a' }]);
+  assert.deepEqual(own.uncacheable, []);
+  assert.equal(own.inputs.size, 0);
+  // The private dir's own file moved into the repo is an output there.
+  assert.ok(priv([{ kind: 'move', path: `${P}/tmp/build`, to: '/work/repo/dist' }]).outputs.has('/work/repo/dist'));
+  // A rename of a link inside the private dir moves the link, not its target.
+  const ln = priv([{ kind: 'symlink', path: `${P}/tmp/a`, target: '/work/repo/src' }, { kind: 'move', path: `${P}/tmp/a`, to: `${P}/tmp/b` }, { kind: 'read', path: `${P}/tmp/b/x.js` }]);
+  assert.deepEqual(ln.uncacheable, []);
+  assert.deepEqual([...ln.inputs.keys()], ['/work/repo/src/x.js']);
+});
+
+test('soundness: a hard link to a file the run did not create is uncacheable; to its own file it is free', () => {
+  assert.match(priv([{ kind: 'hardlink', path: `${P}/tmp/h`, from: '/work/repo/fixture.txt' }]).uncacheable[0], /hard link to a file the run did not create: fixture.txt/);
+  assert.deepEqual(priv([{ kind: 'write', path: `${P}/tmp/a` }, { kind: 'hardlink', path: `${P}/tmp/h`, from: `${P}/tmp/a` }]).uncacheable, []);
+});
+
+test('a symlink whose target strace did not show makes paths through it uncacheable', () => {
+  const out = priv([{ kind: 'symlink', path: `${P}/tmp/l`, target: null }, { kind: 'read', path: `${P}/tmp/l/x` }]);
+  assert.match(out.uncacheable[0], /symlink the run created has a target testonce cannot read/);
+});
+
+test('follow resolves through the run\'s own links like the kernel, and leaves other paths alone', async () => {
+  const { follow } = await import('../src/inputs.mjs');
+  const links = new Map([['/t/a', '/r/x/y'], ['/t/b', 'a/../z'], ['/t/loop', 'loop']]);
+  assert.equal(follow('/t/a/f', links), '/r/x/y/f');
+  assert.equal(follow('/t/a/../f', links), '/r/x/f');
+  assert.equal(follow('/t/b/f', links), '/r/x/z/f', 'b -> a/../z: a is a link, so .. climbs from /r/x/y');
+  assert.equal(follow('/t/c/../d', links), '/t/d');
+  assert.equal(follow('/t/loop/x', links), null);
+  assert.equal(follow('/u/../v', new Map()), '/v');
+});
+
+test('env fingerprint, privateTmp: TMPDIR, TMP and TEMP are a fixed placeholder and always counted; other variables still count', async () => {
+  const { envFingerprint, PRIVATE_TMP_PLACEHOLDER } = await import('../src/cache.mjs');
+  const on = { privateTmp: true };
+  const a = envFingerprint({ PATH: '/bin', TMPDIR: '/tmp/1', MODE: 'a' }, {}, on);
+  assert.equal(a.hash, envFingerprint({ PATH: '/bin', TMPDIR: '/var/tmp/2', TMP: '/x', MODE: 'a' }, {}, on).hash);
+  assert.notEqual(a.hash, envFingerprint({ PATH: '/bin', TMPDIR: '/tmp/1', MODE: 'b' }, {}, on).hash);
+  assert.deepEqual(a.names, ['MODE', 'PATH', 'TEMP', 'TMP', 'TMPDIR']);
+  assert.ok(PRIVATE_TMP_PLACEHOLDER.includes('private-tmp'));
+  // Turning it on or off always changes the hash, whatever the mode or exclude list, so neither pass serves the other.
+  for (const cfg of [{}, { exclude: ['TMPDIR', 'TMP', 'TEMP'] }, { mode: 'allowlist' }]) {
+    for (const env of [{ PATH: '/bin' }, { PATH: '/bin', TMPDIR: '/tmp' }]) {
+      assert.notEqual(envFingerprint(env, cfg, on).hash, envFingerprint(env, cfg).hash, JSON.stringify({ cfg, env }));
+    }
+  }
+});

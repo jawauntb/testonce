@@ -25,6 +25,19 @@ Owner: The Aura Farming Company of New York LLC. These rules apply to every agen
   `node scripts/sync-public.mjs ../testonce-public`, then branch, commit and open a PR on the public
   repo. The script commits and pushes nothing. The public repo keeps its own `.github/workflows/ci.yml`.
 
+## Lean and slop-free
+- **The size ratchet.** `node scripts/size.mjs --check` runs in CI: the gzip -9 size of shipped code
+  (`bin/`, `src/`, `server/`) may not exceed `size-budget.json`. A PR that shrinks it runs
+  `--update` to lock the gain in. A PR that must grow it raises `bytes` by hand and says why in
+  `reason`. Growth is always a written decision; shrinkage is automatic.
+- **One home per idea.** A helper used in two places lives in one module and is imported
+  (example: `queryKeys` and `bloomKey` live in `src/bloom.mjs`). Duplicated logic is a bug.
+- **SOLID, in this codebase's terms:** each module does one job (trace, inputs, cache, cli
+  dispatch, each add-on); add-ons extend the CLI through `main(args, ctx)` without editing core
+  logic; paid modules load on demand so the free core never depends on them; no new dependency
+  without removing more code than it replaces.
+- **Deslop before you add.** Run `testonce deslop --dry-run` on the paths you touched.
+
 ## Claims
 - The README's "What is true today" table is the source of truth. The site, `llms.txt`, launch copy
   and messages never claim more than it does. Measured numbers say "one repo, one machine".

@@ -3,6 +3,7 @@ import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, renameSync, existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
+import { VARS as TMP_VARS } from './tmp.mjs';
 
 export const MAX_ENTRIES = 8; // passing input-sets kept per test, so switching branches still hits
 
@@ -21,13 +22,19 @@ const VOLATILE_PREFIX = ['GITHUB_', 'RUNNER_', 'ACTIONS_', 'BUILDKITE_', 'GITLAB
 // It lets results travel between machines whose environments differ (laptops, agent sandboxes),
 // at a price: an unlisted variable that changes a result no longer triggers a rerun; only an audit catches it.
 const ALLOWLIST_DEFAULT = ['PATH', 'LANG', 'LC_ALL', 'TZ', 'NODE_ENV', 'NODE_OPTIONS', 'PYTHONPATH', 'GOFLAGS', 'RUSTFLAGS', 'JAVA_HOME', 'CI'];
-export function envFingerprint(env, { include = [], exclude = [], mode = 'all' } = {}) {
+// With privateTmp on, TMPDIR, TMP and TEMP point at a fresh directory every run (src/tmp.mjs), so their value
+// is hashed as this fixed placeholder. What the test finds through them is traced like any other path.
+export const PRIVATE_TMP_PLACEHOLDER = '<testonce-private-tmp>';
+export function envFingerprint(env, { include = [], exclude = [], mode = 'all' } = {}, { privateTmp = false } = {}) {
+  if (privateTmp) env = { ...env, ...Object.fromEntries(TMP_VARS.map((n) => [n, PRIVATE_TMP_PLACEHOLDER])) };
   const inc = new Set(include), exc = new Set(exclude);
   const allow = new Set([...ALLOWLIST_DEFAULT, ...include]);
   const keep = mode === 'allowlist'
     ? (n) => allow.has(n) && !exc.has(n)
     : (n) => inc.has(n) || (!exc.has(n) && !VOLATILE_EXACT.has(n) && !VOLATILE_PREFIX.some((p) => n.startsWith(p)));
-  const names = Object.keys(env).filter(keep).sort();
+  // With privateTmp the three names always count, whatever the mode or exclude list says, so a pass recorded
+  // with the shared temp dir never matches a run with a private one, or the reverse.
+  const names = Object.keys(env).filter(privateTmp ? (n) => TMP_VARS.includes(n) || keep(n) : keep).sort();
   const h = createHash('sha256');
   for (const n of names) h.update(n).update('\0').update(env[n]).update('\0');
   return { hash: h.digest('hex'), names };
@@ -52,6 +59,8 @@ export function loadConfig(root) {
     trustStat: process.env.TESTONCE_TRUST_STAT === '0' ? false : cfg.trustStat ?? true,
     linux: cfg.linux ?? false,
     noCache: cfg.noCache ?? [],
+    // Each run gets its own empty temp dir (src/tmp.mjs). TESTONCE_PRIVATE_TMP=0 or "privateTmp": false turns it off.
+    privateTmp: process.env.TESTONCE_PRIVATE_TMP === '0' ? false : process.env.TESTONCE_PRIVATE_TMP === '1' ? true : cfg.privateTmp ?? true,
   };
 }
 
