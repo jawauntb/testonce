@@ -35,9 +35,9 @@ testonce: 37 files: 21 skipped, 16 ran, 0 failed
 |---|---|
 | Records every file a test reads, lists, probes or executes, across child processes | Implemented, tested (`test/cli.test.mjs`) |
 | Skips only when every recorded input is byte-identical (SHA-256), with the same command and env | Implemented, tested |
-| A file the test reads and then rewrites makes it uncacheable, never wrongly cached | Implemented, tested |
+| A file the test reads, or opens for writing without truncating it, and then rewrites makes it uncacheable, never wrongly cached | Implemented, tested |
 | Each test gets its own empty temp directory (`TMPDIR`, `TMP`, `TEMP`), removed when the test ends, so temp files never make a test rerun and never pile up. No temp-dir naming rule or sweeper script is needed | Implemented, tested (`test/cli.test.mjs`, `test/tmp.test.mjs`). A testonce killed with SIGKILL leaves its directory behind; a later run deletes it after 24 h. On by default; `"privateTmp": false` turns it off |
-| Tests that reach the network or run `git`, `curl`, `docker`, `ssh`… always run | Implemented, tested |
+| Tests that reach the network (including a loopback server they did not start) or run `git`, `curl`, `docker`, `ssh`… always run | Implemented, tested |
 | Every 10th would-be skip runs anyway; a failure on unchanged inputs quarantines the test | Implemented, tested |
 | `affected` (lists the tests an edit might affect) never misses a test whose recorded inputs include a changed path | **Verified** for the bloom model (`formal/Testonce/Bloom.lean`, SafeVerify receipt in `docs/lea/`); index range checked by tests |
 | A skipped test would have passed, given the three assumptions below | **Verified** (`formal/Testonce/Skip.lean`, SafeVerify receipt in `docs/lea/`) |
@@ -84,7 +84,16 @@ cached. When a test reads a symlink itself (`readlink`, or `lstat` finding a lin
 is recorded, so repointing it reruns the test even if the new target has the same type and bytes. A test
 that talks to an abstract unix socket (`@name`, which has no file to hash) counts as using the network
 and is not cached. So does one that sends to an outside address with `sendmmsg`, and every address in
-the call is checked, not just the first.
+the call is checked, not just the first. A connection or datagram to a loopback address counts as using the
+network unless the test itself bound that address and port, with the same socket type, before reaching it
+(or was refused while its own server was starting), so a dev server, a CI service container or a daemon on
+localhost makes the test uncacheable. A file the test opens for writing without truncating it (an append,
+`a+`, a SQLite database, `truncate` to a length) keeps its old bytes, so they count as read and the test is
+not cached, unless the test first found the path missing. Creating a directory, a link or an `O_EXCL` file
+records the path as missing beforehand (a dangling symlink there does not count as missing), and deleting a
+file or directory records it as present beforehand. Changing a file's mode or timestamps (`chmod`, `utimes`)
+leaves it an input instead of making it an output. A repo or working directory under `/proc`, `/sys`, `/dev`
+or `/run` is never cached, because every file in it would be ignored.
 
 **Temp files.** Each test runs with `TMPDIR`, `TMP` and `TEMP` set to a new, empty directory that
 testonce creates for that run (`<temp dir>/testonce-XXXXXX/tmp`) and deletes when the test ends: pass,

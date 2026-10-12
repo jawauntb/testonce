@@ -72,7 +72,8 @@ test('network: abstract unix sockets, and every destination of a sendmmsg', () =
   const two = (a, b) => `3, [{msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr("${a}")}, msg_namelen=16, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=1}, {msg_hdr={msg_name={sa_family=AF_INET, sin_port=htons(9), sin_addr=inet_addr("${b}")}, msg_namelen=16, msg_iov=[{iov_base="x", iov_len=1}], msg_iovlen=1, msg_controllen=0, msg_flags=0}, msg_len=1}], 2, 0`;
   assert.equal(network(two('127.0.0.1', '192.0.2.1')), '192.0.2.1:9');
   assert.equal(network(two('127.0.0.1', '127.0.0.2')), null);
-  assert.deepEqual(parse(`1  sendmmsg(${two('127.0.0.1', '192.0.2.1')}) = 2`, '/'), [{ kind: 'net', path: '192.0.2.1:9' }]);
+  // The loopback destination too: nothing in the run bound 127.0.0.1:9.
+  assert.deepEqual(parse(`1  sendmmsg(${two('127.0.0.1', '192.0.2.1')}) = 2`, '/'), [{ kind: 'net', path: '192.0.2.1:9' }, { kind: 'net', path: '127.0.0.1:9 (loopback, but no server the run started)' }]);
 });
 
 test('rename, link and symlink: what moved, what got a second name, where a link points; failures are probes', () => {
@@ -91,10 +92,68 @@ test('rename, link and symlink: what moved, what got a second name, where a link
     { kind: 'move', path: '/r/a.part', to: '/r/a' },
     { kind: 'move', path: '/r/x', to: '/r/y' }, { kind: 'move', path: '/r/y', to: '/r/x' },
     { kind: 'absent', path: '/r/gone' },
-    { kind: 'hardlink', path: '/t/h', from: '/r/fixture.txt' },
-    { kind: 'symlink', path: '/r/t/l', target: '../lib' },
+    { kind: 'absent', path: '/t/h' }, { kind: 'hardlink', path: '/t/h', from: '/r/fixture.txt' },
+    { kind: 'absent', path: '/r/t/l' }, { kind: 'symlink', path: '/r/t/l', target: '../lib' },
     { kind: 'stat', path: '/r/exists' },
     { kind: 'read', path: '/r/t/l/a.js' }, { kind: 'read', path: '/lib/a.js' },
     { kind: 'absent', path: '/r/t/m', via: '/r/t/l/../m' },
   ]);
+});
+
+// ---- loopback is the run's own world only at an (address, port) the run bound ----
+const V4 = (host, port) => `{sa_family=AF_INET, sin_port=htons(${port}), sin_addr=inet_addr("${host}")}`;
+const V6 = (host, port) => `{sa_family=AF_INET6, sin6_port=htons(${port}), sin6_flowinfo=htonl(0), inet_pton(AF_INET6, "${host}", &sin6_addr), sin6_scope_id=0}`;
+const sock = (ino, fam = 'AF_INET', type = 'SOCK_STREAM') => `1  socket(${fam}, ${type}|SOCK_CLOEXEC, IPPROTO_IP) = 3<socket:[${ino}]>`;
+const nets = (lines) => parse(log(lines), '/r').filter((e) => e.kind === 'net').map((e) => e.path.split(' ')[0]);
+
+test('loopback: a destination nothing in the run bound is the outside world (a dev server, a DNS stub, a database)', () => {
+  assert.deepEqual(nets([sock(1), `1  connect(3<socket:[1]>, ${V4('127.0.0.1', 5432)}, 16) = 0`]), ['127.0.0.1:5432']);
+  assert.deepEqual(nets([sock(1, 'AF_INET', 'SOCK_DGRAM'), `1  sendto(3<socket:[1]>, "x", 1, 0, ${V4('127.0.0.53', 53)}, 16) = 1`]), ['127.0.0.53:53']);
+  assert.deepEqual(nets([sock(1, 'AF_INET6'), `1  connect(3<socket:[1]>, ${V6('::1', 6379)}, 28) = 0`]), ['[::1]:6379']);
+  assert.deepEqual(nets([sock(1, 'AF_INET6'), `1  connect(3<socket:[1]>, ${V6('::ffff:127.0.0.1', 80)}, 28) = 0`]), ['127.0.0.1:80']);
+  assert.deepEqual(nets([sock(1), `1  connect(3<socket:[1]>, ${V4('0.0.0.0', 80)}, 16) = 0`]), ['127.0.0.1:80'], 'the wildcard dials loopback');
+});
+
+test('loopback: bound by the run at that address and port, before the connect, is local; port 0 is read from getsockname', () => {
+  assert.deepEqual(nets([sock(1), `1  bind(3<socket:[1]>, ${V4('127.0.0.1', 8080)}, 16) = 0`, sock(2), `2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8080)}, 16) = 0`]), []);
+  assert.deepEqual(nets([
+    sock(1), `1  bind(3<socket:[1]>, ${V4('127.0.0.1', 0)}, 16) = 0`, `1  getsockname(3<socket:[1]>, ${V4('127.0.0.1', 46509)}, [128 => 16]) = 0`,
+    sock(2), `2  connect(4<socket:[2]>, ${V4('127.0.0.1', 46509)}, 16) = -1 EINPROGRESS (Operation now in progress)`,
+  ]), []);
+  // getsockname of a client socket names its own end, not a server.
+  assert.deepEqual(nets([sock(1), `1  connect(3<socket:[1]>, ${V4('127.0.0.1', 80)}, 16) = 0`, `1  getsockname(3<socket:[1]>, ${V4('127.0.0.1', 40000)}, [16]) = 0`, sock(2), `1  connect(4<socket:[2]>, ${V4('127.0.0.1', 40000)}, 16) = 0`]), ['127.0.0.1:80', '127.0.0.1:40000']);
+});
+
+test('loopback: keyed by address, port and socket type, never the port alone', () => {
+  assert.deepEqual(nets([sock(1), `1  bind(3<socket:[1]>, ${V4('127.0.0.2', 8080)}, 16) = 0`, sock(2), `1  connect(4<socket:[2]>, ${V4('127.0.0.1', 8080)}, 16) = 0`]), ['127.0.0.1:8080']);
+  assert.deepEqual(nets([sock(1), `1  bind(3<socket:[1]>, ${V4('127.0.0.1', 53)}, 16) = 0`, sock(2, 'AF_INET', 'SOCK_DGRAM'), `1  sendto(4<socket:[2]>, "x", 1, 0, ${V4('127.0.0.1', 53)}, 16) = 1`]), ['127.0.0.1:53'], 'a TCP server does not answer UDP');
+  assert.deepEqual(nets([sock(1), `1  bind(3<socket:[1]>, ${V4('127.0.0.1', 9000)}, 16) = -1 EADDRINUSE (Address already in use)`, sock(2), `1  connect(4<socket:[2]>, ${V4('127.0.0.1', 9000)}, 16) = 0`]), ['127.0.0.1:9000'], 'a failed bind starts no server');
+  // A wildcard answers every address of its family; the IPv6 one answers IPv4 too unless IPv6-only.
+  assert.deepEqual(nets([sock(1), `1  bind(3<socket:[1]>, ${V4('0.0.0.0', 80)}, 16) = 0`, sock(2), `1  connect(4<socket:[2]>, ${V4('127.0.0.9', 80)}, 16) = 0`, sock(3, 'AF_INET6'), `1  connect(5<socket:[3]>, ${V6('::1', 80)}, 28) = 0`]), ['[::1]:80']);
+  const dual = (v6only) => [sock(1, 'AF_INET6'), ...(v6only == null ? [] : [`1  setsockopt(3<socket:[1]>, SOL_IPV6, IPV6_V6ONLY, [${v6only}], 4) = 0`]), `1  bind(3<socket:[1]>, ${V6('::', 80)}, 28) = 0`, sock(2), `1  connect(4<socket:[2]>, ${V4('127.0.0.1', 80)}, 16) = 0`];
+  assert.deepEqual(nets(dual(0)), []);
+  assert.deepEqual(nets(dual(1)), ['127.0.0.1:80']);
+});
+
+test('loopback: a connect before the run bound the address is local only if it was refused (a client waiting for its own server)', () => {
+  const late = (result) => [sock(2), ...result, sock(1), `1  bind(3<socket:[1]>, ${V4('127.0.0.1', 8081)}, 16) = 0`];
+  assert.deepEqual(nets(late([`2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8081)}, 16) = -1 ECONNREFUSED (Connection refused)`])), []);
+  assert.deepEqual(nets(late([`2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8081)}, 16) = -1 EINPROGRESS (Operation now in progress)`, `2  getsockopt(4<socket:[2]>, SOL_SOCKET, SO_ERROR, [ECONNREFUSED], [4]) = 0`])), []);
+  assert.deepEqual(nets(late([`2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8081)}, 16) = -1 EINPROGRESS (Operation now in progress)`, `2  getsockopt(4<socket:[2]>, SOL_SOCKET, SO_ERROR, [0], [4]) = 0`])), ['127.0.0.1:8081'], 'it got through: someone else answered');
+  assert.deepEqual(nets(late([`2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8081)}, 16) = -1 EINPROGRESS (Operation now in progress)`])), ['127.0.0.1:8081'], 'never settled: unknown');
+  assert.deepEqual(nets(late([`2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8081)}, 16) = 0`])), ['127.0.0.1:8081']);
+  assert.deepEqual(nets([sock(2), `2  connect(4<socket:[2]>, ${V4('127.0.0.1', 8082)}, 16) = -1 ECONNREFUSED (Connection refused)`]), ['127.0.0.1:8082'], 'refused with no server of the run\'s own: it depended on nothing being there');
+});
+
+test('a call that succeeds only on what was there observed it; a write that keeps old bytes reads them', () => {
+  const ev = (l) => parse(l, '/r');
+  assert.deepEqual(ev('1  mkdir("out", 0777) = 0'), [{ kind: 'absent', path: '/r/out' }, { kind: 'write', path: '/r/out' }]);
+  assert.deepEqual(ev('1  mkdir("out", 0777) = -1 EEXIST (File exists)'), [{ kind: 'stat', path: '/r/out' }]);
+  assert.deepEqual(ev('1  unlinkat(AT_FDCWD</r>, "d", AT_REMOVEDIR) = 0'), [{ kind: 'stat', path: '/r/d', type: 'dir' }, { kind: 'write', path: '/r/d' }]);
+  assert.deepEqual(ev('1  unlink("f") = -1 ENOENT (No such file or directory)'), [{ kind: 'absent', path: '/r/f' }]);
+  assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "lock", O_WRONLY|O_CREAT|O_EXCL, 0666) = 3</r/lock>'), [{ kind: 'absent', path: '/r/lock' }, { kind: 'write', path: '/r/lock' }]);
+  assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "log", O_WRONLY|O_CREAT|O_APPEND, 0666) = 3</r/log>'), [{ kind: 'read', path: '/r/log', kept: true }, { kind: 'write', path: '/r/log' }]);
+  assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "out", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3</r/out>'), [{ kind: 'write', path: '/r/out' }]);
+  assert.deepEqual(ev('1  truncate("f", 2) = 0'), [{ kind: 'read', path: '/r/f', type: 'file' }, { kind: 'write', path: '/r/f' }]);
+  assert.deepEqual(ev('1  chmod("s.sh", 0755) = 0'), [{ kind: 'stat', path: '/r/s.sh' }]);
 });

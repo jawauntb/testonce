@@ -1,10 +1,11 @@
 // From traced access events to a manifest of inputs, and back: re-hash a manifest against today's disk.
 import { createHash } from 'node:crypto';
-import { openSync, readSync, closeSync, statSync, readdirSync, readlinkSync, realpathSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
+import { openSync, readSync, closeSync, statSync, lstatSync, readdirSync, readlinkSync, realpathSync, readFileSync, writeFileSync, renameSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 
 export const DEFAULT_DENY_EXEC = ['git', 'curl', 'wget', 'ssh', 'scp', 'rsync', 'docker', 'podman', 'kubectl', 'gh', 'aws', 'gcloud', 'az', 'nc', 'ping'];
 const ALWAYS_IGNORED = ['/proc', '/sys', '/dev', '/run'];
+export const underIgnored = (abs) => ALWAYS_IGNORED.some((p) => abs === p || abs.startsWith(p + '/'));
 
 // Glob with ** and *, matched against the stored (root-relative or absolute) path.
 export function globRe(g) {
@@ -15,9 +16,9 @@ export function globRe(g) {
 export function makeIgnore({ root, cacheDir, ignore = [] }) {
   // The temp dir is NOT ignored: a fixture there is an input like any other. Files a test creates
   // in it are outputs by the write-first rule, so they cost nothing.
-  const prefixes = [...ALWAYS_IGNORED, path.resolve(cacheDir)];
+  const cache = path.resolve(cacheDir);
   const res = ignore.map(globRe);
-  return (abs, key) => prefixes.some((p) => abs === p || abs.startsWith(p + '/')) || res.some((r) => r.test(key));
+  return (abs, key) => underIgnored(abs) || abs === cache || abs.startsWith(cache + '/') || res.some((r) => r.test(key));
 }
 
 // Paths inside the repo are stored relative so manifests survive a checkout at a different path.
@@ -101,6 +102,7 @@ export function reduce(events, { root, cacheDir, ignore, denyExec = DEFAULT_DENY
     }
     if (e.kind === 'write') { wrote(abs); continue; }
     if (e.kind === 'link') { for (const q of new Set([abs, locate(e.via ?? abs)])) if (!dropped(q) && !outputs.has(q)) linksSeen.add(q); continue; }
+    if (e.kept && inputs.get(abs) === 'absent') continue; // seen absent first: there were no old bytes to keep
     const r = real(e.via ?? abs);
     observe(e.kind, abs, e.type);
     if (r && r !== abs) observe(e.kind, r, e.type);
@@ -177,7 +179,10 @@ function typeOf(abs) {
   try {
     const s = statSync(abs);
     return s.isFile() ? 'file' : s.isDirectory() ? 'dir' : 'other';
-  } catch { return 'absent'; }
+  } catch {
+    // A dangling symlink is not absent: mkdir, symlink, link and O_EXCL fail on it.
+    try { lstatSync(abs); return 'dangling'; } catch { return 'absent'; }
+  }
 }
 
 // kind: read -> content hash; list -> sorted entry names minus the run's own outputs; link -> link target;
