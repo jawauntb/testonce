@@ -44,6 +44,7 @@ testonce: 37 files: 21 skipped, 16 ran, 0 failed
 | A pass recorded on one machine skips on another (`share push` / `share pull`, via a branch on your own git remote) | Implemented, tested across two clones (`test/share.test.mjs`) |
 | Paid features are delivered by license key: checkout issues a key, and with `TESTONCE_KEY` set the CLI downloads the modules that plan covers on first use | Implemented, tested against a local fake service (`test/unlock.test.mjs`, `server/test/licenses.test.mjs`); not yet exercised with a live Stripe payment |
 | On a Mac, `testonce each --linux ...` / `run --linux ...` runs the tests in a Linux container (Docker Desktop, OrbStack, Colima or Podman), where skips work | Implemented. Tested on Linux: units and an end-to-end run against a stand-in `docker` (`test/linux*.test.mjs`), and real Docker in CI (`test/ci/linux-flow.sh`). `doctor`, the every-test-runs fallback and the no-runtime message are run on a macOS CI runner (`test/ci/mac-flow.sh`). **Not run on a real Mac with a real container runtime.** Container records match later `--linux` runs on that Mac only, not CI. See `docs/mac.md` |
+| Public replays on open-source hardware projects (wb2axip formal proofs, verilog-axis cocotb tests, three openc910 CPU cases), each project's own command as the check | Measured, one GitHub-hosted 4-core runner per project, 6 to 8 commits each, in public at jawauntb/testoncebench (run 38190950150, sha256 receipts): 0 wrong skips, every injected break caught (19 of 19), 10.7x on wb2axip with the one `ignore` line testonce suggests (0.92x without it), 2.6x on verilog-axis; openc910's replayed commits change only docs |
 | Skips natively on macOS or Windows (without a container) | **No.** Tracing needs Linux strace; natively every test runs. A native macOS tracer is not built because it could not be shown complete without testing on Macs (`docs/mac.md`). The shared cache pays off between Linux machines (CI, Linux dev containers, agent sandboxes) |
 | Broken tests get fixed automatically | **No.** `testonce fix` writes a brief of exactly what changed since the last pass and can hand it to your own coding agent; the agent does the fixing |
 
@@ -92,7 +93,11 @@ localhost makes the test uncacheable. A file the test opens for writing without 
 not cached, unless the test first found the path missing. Creating a directory, a link or an `O_EXCL` file
 records the path as missing beforehand (a dangling symlink there does not count as missing), and deleting a
 file or directory records it as present beforehand. Changing a file's mode or timestamps (`chmod`, `utimes`)
-leaves it an input instead of making it an output. A repo or working directory under `/proc`, `/sys`, `/dev`
+leaves it an input instead of making it an output. An append to one of GitHub Actions' runner command files, the
+exact paths named by `GITHUB_STEP_SUMMARY`, `GITHUB_OUTPUT`, `GITHUB_ENV`, `GITHUB_PATH` and `GITHUB_STATE` in the
+test's environment, through a write-only descriptor (as Vitest's job summary does) is an output, not a kept input,
+so it no longer stops the test being cached; reading, stat-ing or opening one read-write still makes the test
+uncacheable, and a skipped test does not append its lines again. A repo or working directory under `/proc`, `/sys`, `/dev`
 or `/run` is never cached, because every file in it would be ignored.
 
 **Temp files.** Each test runs with `TMPDIR`, `TMP` and `TEMP` set to a new, empty directory that
@@ -124,6 +129,13 @@ doesn't matter.
 
 Tests you know depend on the clock or randomness: list their names or globs in `noCache` and they
 always run.
+
+Node reads `/etc/resolv.conf` and `/etc/nsswitch.conf` when the `dns` module loads, and `/etc/hosts`,
+`/etc/host.conf` and both again on its first name lookup, and these files can differ between CI machines, so a
+recorded Node test that loads `dns` will not skip on another runner; testonce keeps them as inputs because
+`dns.getServers()` returns what `resolv.conf` says with no lookup strace could see, and a name resolved from
+`/etc/hosts` is acted on. If your tests resolve only `localhost` and never read the resolver settings, you may
+add `"ignore": ["/etc/resolv.conf", "/etc/hosts"]` knowingly: an edit to either then no longer reruns them.
 
 To share results between machines whose environments differ (a laptop and CI, or coding-agent
 sandboxes with per-session variables), set `"env": {"mode": "allowlist", "include": [...]}`.

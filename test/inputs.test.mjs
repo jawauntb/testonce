@@ -15,6 +15,21 @@ test('a path first touched by a write is an output, not an input', () => {
   assert.deepEqual(out.uncacheable, []);
 });
 
+test('a runner command file: a write-only append is an output; a read after the append, or before it, is not cached', () => {
+  const S = '/home/runner/work/_temp/_runner_file_commands/step_summary_1';
+  const sink = (events) => reduce(events, { ...opts, sinks: [S] });
+  const append = [{ kind: 'read', path: S, kept: true, wo: true }, { kind: 'write', path: S }];
+  const ok = sink(append);
+  assert.deepEqual([ok.inputs.size, ok.uncacheable], [0, []]);
+  assert.ok(ok.outputs.has(S));
+  // An output's later reads are normally the run's own bytes; here they include what was there before.
+  assert.match(sink([...append, { kind: 'read', path: S }]).uncacheable[0], /runner command file used other than by appending/);
+  assert.match(sink([{ kind: 'stat', path: S, type: 'file' }, ...append]).uncacheable[0], /runner command file/);
+  assert.match(sink([{ kind: 'read', path: S, kept: true }, { kind: 'write', path: S }]).uncacheable[0], /runner command file/, 'read-write open');
+  // The same append to any other path still keeps its old bytes as an input.
+  assert.match(reduce(append, opts).uncacheable[0], /input modified by the run/);
+});
+
 test('reading a file and then rewriting it makes the run uncacheable', () => {
   const out = r([{ kind: 'read', path: '/work/repo/snap.txt' }, { kind: 'write', path: '/work/repo/snap.txt' }]);
   assert.match(out.uncacheable[0], /input modified by the run: snap.txt/);

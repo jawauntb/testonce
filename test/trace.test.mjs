@@ -152,7 +152,9 @@ test('a call that succeeds only on what was there observed it; a write that keep
   assert.deepEqual(ev('1  unlinkat(AT_FDCWD</r>, "d", AT_REMOVEDIR) = 0'), [{ kind: 'stat', path: '/r/d', type: 'dir' }, { kind: 'write', path: '/r/d' }]);
   assert.deepEqual(ev('1  unlink("f") = -1 ENOENT (No such file or directory)'), [{ kind: 'absent', path: '/r/f' }]);
   assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "lock", O_WRONLY|O_CREAT|O_EXCL, 0666) = 3</r/lock>'), [{ kind: 'absent', path: '/r/lock' }, { kind: 'write', path: '/r/lock' }]);
-  assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "log", O_WRONLY|O_CREAT|O_APPEND, 0666) = 3</r/log>'), [{ kind: 'read', path: '/r/log', kept: true }, { kind: 'write', path: '/r/log' }]);
+  assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "log", O_WRONLY|O_CREAT|O_APPEND, 0666) = 3</r/log>'), [{ kind: 'read', path: '/r/log', kept: true, wo: true }, { kind: 'write', path: '/r/log' }]);
+  // Read-write: the descriptor can read the kept bytes, so it is not marked write-only.
+  assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "db", O_RDWR|O_CREAT|O_APPEND, 0666) = 3</r/db>'), [{ kind: 'read', path: '/r/db', kept: true }, { kind: 'write', path: '/r/db' }]);
   assert.deepEqual(ev('1  openat(AT_FDCWD</r>, "out", O_WRONLY|O_CREAT|O_TRUNC, 0666) = 3</r/out>'), [{ kind: 'write', path: '/r/out' }]);
   assert.deepEqual(ev('1  truncate("f", 2) = 0'), [{ kind: 'read', path: '/r/f', type: 'file' }, { kind: 'write', path: '/r/f' }]);
   assert.deepEqual(ev('1  chmod("s.sh", 0755) = 0'), [{ kind: 'stat', path: '/r/s.sh' }]);

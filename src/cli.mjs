@@ -8,7 +8,7 @@ export { bloomKey, queryKeys };
 import { traced, traceStatus } from './trace.mjs';
 import { doctor, noTraceMessage } from './doctor.mjs';
 import { splitLinuxFlag, wantsLinux, inContainer, runInLinux, realIo } from './linux.mjs';
-import { reduce, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore, underIgnored, resetMemo } from './inputs.mjs';
+import { reduce, runnerFiles, snapshot, firstChanged, keyOf, globRe, useHashStore, flushHashStore, underIgnored, resetMemo } from './inputs.mjs';
 import { unlock } from './unlock.mjs';
 import { makePrivateTmp, removeTree, sweepSometimes } from './tmp.mjs';
 import { envFingerprint, PRIVATE_TMP_PLACEHOLDER, findRoot, loadConfig, load, save, all, clear, MAX_ENTRIES } from './cache.mjs';
@@ -167,7 +167,7 @@ export async function run(args) {
     save(cfg.cacheDir, rec);
     return code;
   }
-  const reduced = reduce(accesses, { root, cacheDir: cfg.cacheDir, ignore: cfg.ignore, denyExec: cfg.denyExec, privateDirs: tmp?.prefixes });
+  const reduced = reduce(accesses, { root, cacheDir: cfg.cacheDir, ignore: cfg.ignore, denyExec: cfg.denyExec, privateDirs: tmp?.prefixes, sinks: runnerFiles(process.env, cwd) });
   // The pass must hold under the configuration the key claims: with privateTmp on, a run that fell back to the
   // shared temp dir is not recorded.
   if (cfg.privateTmp && !tmp) reduced.uncacheable.unshift('could not create a private temp dir, so this run used the shared one');
